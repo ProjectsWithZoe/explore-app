@@ -33,6 +33,15 @@
         height: 100%;
         flex: 1;
       }
+      /* iOS home-screen apps with a translucent status bar size `100%` as the screen minus the
+         status bar, leaving a gap at the bottom. 100vh is the full screen there (no browser toolbars). */
+      @media (display-mode: standalone) {
+        html,
+        body,
+        #root {
+          height: 100vh;
+        }
+      }
     </style>
   </head>
 

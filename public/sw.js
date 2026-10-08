@@ -3,7 +3,7 @@
 // - Hashed build assets and icons: cache first (their URLs change on every build).
 // Map tiles and routing requests are not cached; they need a connection.
 
-const CACHE = 'walkexplore-v1';
+const CACHE = 'walkexplore-v2';
 const SHELL = ['/', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (event) => {
