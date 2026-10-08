@@ -1,0 +1,36 @@
+{
+  "expo": {
+    "name": "WalkExplore",
+    "slug": "walkexplore",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "scheme": "walkexplore",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.walkexplore.app"
+    },
+    "android": {
+      "package": "com.walkexplore.app"
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "WalkExplore uses your location to center the map and let you start routes from where you are."
+        }
+      ],
+      "expo-sqlite",
+      "react-native-maps"
+    ],
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "name": "WalkExplore",
+      "shortName": "WalkExplore",
+      "description": "Plan, save and log walking routes.",
+      "themeColor": "#1F6B4A",
+      "backgroundColor": "#F4F5EF"
+    }
+  }
+}
