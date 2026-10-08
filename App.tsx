@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Modal,
+  PanResponder,
   Platform,
   Pressable,
   ScrollView,
@@ -13,6 +14,7 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import * as Location from 'expo-location';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import WalkMap from './src/WalkMap';
 import { deleteRoute, insertRoute, listRoutes } from './src/storage';
 import type { Coordinate, Region, RoutePoint, RouteRecord, WalkMapHandle } from './src/types';
@@ -32,7 +34,6 @@ const COLORS = {
 
 const DEFAULT_CENTER = { latitude: 51.5074, longitude: -0.1278 };
 const ROUTER_URL = 'https://valhalla1.openstreetmap.de/route';
-const TOP_INSET = Platform.select({ ios: 58, android: 28, default: 16 });
 const WIDE_BREAKPOINT = 768;
 
 function uid() {
@@ -152,6 +153,19 @@ async function routeWithValhalla(points: RoutePoint[]) {
 }
 
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <WalkExplore />
+    </SafeAreaProvider>
+  );
+}
+
+function WalkExplore() {
+  const insets = useSafeAreaInsets();
+  // Device insets (notch / status bar / home indicator) are 0 in a normal browser tab
+  // and non-zero natively or when installed as a full-screen PWA.
+  const topInset = insets.top > 0 ? insets.top + 6 : 16;
+  const bottomInset = insets.bottom;
   const mapRef = useRef<WalkMapHandle>(null);
   const { width, height } = useWindowDimensions();
   const isWide = width >= WIDE_BREAKPOINT;
@@ -163,6 +177,9 @@ export default function App() {
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [tab, setTab] = useState<'plan' | 'routes'>('plan');
+  const [panelCollapsed, setPanelCollapsed] = useState(false);
+  // Only the phone bottom sheet can be minimised; the desktop side panel doesn't cover the map.
+  const collapsed = panelCollapsed && !isWide;
   const [points, setPoints] = useState<RoutePoint[]>([]);
   const [routeGeometry, setRouteGeometry] = useState<Coordinate[]>([]);
   const [distanceKm, setDistanceKm] = useState(0);
@@ -275,6 +292,16 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [points]);
+
+  // Sheet handle: tap to toggle the planner, swipe down to minimise, swipe up to bring it back.
+  const sheetPan = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onPanResponderRelease: (_e, g) => {
+      if (g.dy > 30) setPanelCollapsed(true);
+      else if (g.dy < -30) setPanelCollapsed(false);
+      else if (Math.abs(g.dy) < 6 && Math.abs(g.dx) < 6) setPanelCollapsed((c) => !c);
+    },
+  }), []);
 
   function notify(title: string, message: string) {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -395,6 +422,7 @@ export default function App() {
     setSegmentSteps(record.points.slice(1).map((p, i) => estimatedStepsForDistance(haversineKm(record.points[i], p))));
     setRouteName(record.name);
     setSelectedRecord(null);
+    setPanelCollapsed(false);
     setTab('plan');
   }
 
@@ -405,7 +433,7 @@ export default function App() {
 
   return (
     <View style={styles.root}>
-      <StatusBar barStyle="dark-content" />
+      <StatusBar barStyle="dark-content" translucent backgroundColor="transparent" />
       {tab === 'plan' ? (
         <View style={styles.planScreen}>
           <WalkMap
@@ -420,7 +448,7 @@ export default function App() {
             bottomInset={isWide ? 0 : panelHeight}
           />
 
-          <View style={[styles.topOverlay, isWide && styles.topOverlayWide]}>
+          <View style={[styles.topOverlay, { top: topInset }, isWide && styles.topOverlayWide]}>
             <View style={styles.brandPill}>
               <View style={styles.brandDot} />
               <Text style={styles.brand}>WalkExplore</Text>
@@ -440,21 +468,69 @@ export default function App() {
           </View>
 
           <View
-            style={[styles.bottomPanel, isWide ? [styles.sidePanel, { maxHeight: height - TOP_INSET - 18 }] : { maxHeight: height * 0.62 }]}
+            style={[
+              styles.bottomPanel,
+              isWide
+                ? [styles.sidePanel, { top: topInset, maxHeight: height - topInset - 18 }]
+                : { maxHeight: height * 0.62, paddingBottom: Math.max(12, bottomInset) },
+            ]}
             onLayout={(e) => setPanelHeight(e.nativeEvent.layout.height)}
           >
-            {!isWide && <View style={styles.handle} />}
+            {!isWide && (
+              <View>
+                <View
+                  {...sheetPan.panHandlers}
+                  style={styles.handleArea}
+                  accessibilityRole="button"
+                  accessibilityLabel={collapsed ? 'Show route planner' : 'Minimise route planner'}
+                >
+                  <View style={styles.handle} />
+                </View>
+                {collapsed && (
+                  <Pressable style={styles.collapsedRow} onPress={() => setPanelCollapsed(false)}>
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={styles.eyebrow}>ROUTE PLANNER</Text>
+                      <Text style={styles.collapsedSummary} numberOfLines={1}>
+                        {points.length > 1
+                          ? `${formatDistance(distanceKm)} · ${formatDuration(durationMin)} · ${estimatedSteps.toLocaleString()} steps`
+                          : points.length === 1
+                            ? 'Start set. Tap the map to add a stop'
+                            : 'Tap the map to start a walk'}
+                      </Text>
+                    </View>
+                    <View style={styles.collapsedButton}>
+                      <Text style={styles.collapsedButtonText}>Show ⌃</Text>
+                    </View>
+                  </Pressable>
+                )}
+              </View>
+            )}
+            {!collapsed && (
+            <>
             <ScrollView showsVerticalScrollIndicator={false} bounces={false} style={styles.panelScroll}>
             <View style={styles.panelHeader}>
               <View>
                 <Text style={styles.eyebrow}>ROUTE PLANNER</Text>
                 <Text style={styles.title}>Build your walk</Text>
               </View>
-              {points.length > 0 && (
-                <Pressable onPress={clearPlan}>
-                  <Text style={styles.clearText}>Clear</Text>
-                </Pressable>
-              )}
+              <View style={styles.panelHeaderActions}>
+                {points.length > 0 && (
+                  <Pressable onPress={clearPlan} hitSlop={8}>
+                    <Text style={styles.clearText}>Clear</Text>
+                  </Pressable>
+                )}
+                {!isWide && (
+                  <Pressable
+                    style={styles.minimiseButton}
+                    onPress={() => setPanelCollapsed(true)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Minimise route planner"
+                    hitSlop={6}
+                  >
+                    <Text style={styles.minimiseText}>⌄</Text>
+                  </Pressable>
+                )}
+              </View>
             </View>
 
             <Text style={styles.helper}>
@@ -531,10 +607,12 @@ export default function App() {
                 <Text style={styles.tabLabel}>Routes</Text>
               </Pressable>
             </View>
+            </>
+            )}
           </View>
         </View>
       ) : (
-        <View style={[styles.routesScreen, { paddingTop: TOP_INSET }]}>
+        <View style={[styles.routesScreen, { paddingTop: topInset }]}>
           <View style={[styles.routesHeader, styles.contentWidth]}>
             <View>
               <Text style={styles.eyebrow}>YOUR WALKS</Text>
@@ -591,7 +669,7 @@ export default function App() {
             )}
           </ScrollView>
 
-          <View style={styles.routesTabBar}>
+          <View style={[styles.routesTabBar, { paddingBottom: Math.max(9, bottomInset) }]}>
             <Pressable style={styles.tabItem} onPress={() => setTab('plan')}>
               <Text style={styles.tabIcon}>⌁</Text>
               <Text style={styles.tabLabel}>Plan</Text>
@@ -633,7 +711,7 @@ export default function App() {
       <Modal visible={!!selectedRecord} transparent animationType="slide" onRequestClose={() => setSelectedRecord(null)}>
         {selectedRecord && (
           <View style={[styles.detailBackdrop, isWide && styles.detailBackdropWide]}>
-            <View style={[styles.detailCard, isWide && styles.detailCardWide]}>
+            <View style={[styles.detailCard, { paddingBottom: 20 + bottomInset }, isWide && styles.detailCardWide]}>
               <View style={styles.detailHandle} />
               <View style={styles.panelHeader}>
                 <View style={{ flex: 1 }}>
@@ -666,13 +744,13 @@ export default function App() {
       </Modal>
 
       {permissionDenied && tab === 'plan' && (
-        <View style={[styles.permissionBanner, isWide && styles.permissionBannerWide]} pointerEvents="none">
+        <View style={[styles.permissionBanner, { top: topInset + 56 }, isWide && styles.permissionBannerWide]} pointerEvents="none">
           <Text style={styles.permissionText}>Location access is off. You can still plan routes by tapping the map.</Text>
         </View>
       )}
 
       {toast && (
-        <View style={[styles.toast, { top: TOP_INSET }]} pointerEvents="none">
+        <View style={[styles.toast, { top: topInset }]} pointerEvents="none">
           <Text style={styles.toastTitle}>{toast.title}</Text>
           <Text style={styles.toastText}>{toast.message}</Text>
         </View>
@@ -723,7 +801,7 @@ const styles = StyleSheet.create({
   routesScreen: { flex: 1, backgroundColor: COLORS.bg },
   contentWidth: { width: '100%', maxWidth: 760, alignSelf: 'center' },
   topOverlay: {
-    position: 'absolute', top: TOP_INSET, left: 18, right: 18,
+    position: 'absolute', left: 18, right: 18,
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
   },
   topOverlayWide: { left: 436 },
@@ -748,19 +826,30 @@ const styles = StyleSheet.create({
   bottomPanel: {
     position: 'absolute', left: 0, right: 0, bottom: 0, backgroundColor: COLORS.bg,
     borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingHorizontal: 18, paddingTop: 9,
-    paddingBottom: Platform.OS === 'ios' ? 18 : 12,
+    paddingBottom: 12,
     shadowColor: '#000', shadowOpacity: 0.15, shadowRadius: 20, shadowOffset: { width: 0, height: -6 }, elevation: 12,
   },
   sidePanel: {
-    top: TOP_INSET, left: 18, bottom: 'auto', right: 'auto', width: 400,
+    left: 18, bottom: 'auto', right: 'auto', width: 400,
     borderRadius: 28, paddingTop: 20, boxShadow: '0 8px 28px rgba(0,0,0,0.16)',
   },
   panelScroll: { flexGrow: 0, flexShrink: 1 },
-  handle: { alignSelf: 'center', width: 38, height: 4, borderRadius: 2, backgroundColor: '#CBD0CA', marginBottom: 14 },
+  handleArea: { alignSelf: 'stretch', alignItems: 'center', paddingTop: 6, paddingBottom: 14, marginTop: -6, cursor: 'grab' } as any,
+  handle: { width: 38, height: 4, borderRadius: 2, backgroundColor: '#CBD0CA' },
+  collapsedRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingBottom: 4 },
+  collapsedSummary: { fontSize: 16, fontWeight: '800', color: COLORS.ink },
+  collapsedButton: { backgroundColor: COLORS.accentSoft, borderRadius: 16, paddingHorizontal: 14, paddingVertical: 9 },
+  collapsedButtonText: { fontSize: 13, fontWeight: '800', color: COLORS.accent },
+  panelHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 14 },
+  minimiseButton: {
+    width: 34, height: 34, borderRadius: 17, backgroundColor: COLORS.card, borderWidth: 1, borderColor: COLORS.line,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  minimiseText: { fontSize: 18, lineHeight: 20, color: COLORS.ink, fontWeight: '700', marginTop: -4 },
   panelHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
   eyebrow: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5, color: COLORS.muted, marginBottom: 4 },
   title: { fontSize: 27, fontWeight: '800', letterSpacing: -0.8, color: COLORS.ink },
-  clearText: { color: COLORS.danger, fontWeight: '700', marginTop: 8 },
+  clearText: { color: COLORS.danger, fontWeight: '700' },
   helper: { color: COLORS.muted, fontSize: 13, marginTop: 5, marginBottom: 10 },
   pointsRow: { marginBottom: 10 },
   pointChip: {
@@ -809,7 +898,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row', justifyContent: 'space-around',
   },
   routesTabBar: {
-    paddingHorizontal: 18, paddingTop: 8, paddingBottom: Platform.OS === 'ios' ? 17 : 9,
+    paddingHorizontal: 18, paddingTop: 8,
     borderTopWidth: 1, borderTopColor: COLORS.line, flexDirection: 'row', justifyContent: 'space-around', backgroundColor: COLORS.bg,
   },
   tabItem: { alignItems: 'center', minWidth: 80 },
@@ -856,7 +945,7 @@ const styles = StyleSheet.create({
   cancelButton: { flex: 1, minHeight: 46, borderRadius: 14, backgroundColor: COLORS.bg, alignItems: 'center', justifyContent: 'center' },
   cancelText: { fontWeight: '800', color: COLORS.ink },
   detailBackdrop: { flex: 1, backgroundColor: 'rgba(13,22,17,0.28)', justifyContent: 'flex-end' },
-  detailCard: { backgroundColor: COLORS.bg, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 18, paddingBottom: Platform.OS === 'ios' ? 34 : 20 },
+  detailCard: { backgroundColor: COLORS.bg, borderTopLeftRadius: 28, borderTopRightRadius: 28, padding: 18 },
   detailBackdropWide: { justifyContent: 'center', alignItems: 'center', padding: 20 },
   detailCardWide: { width: '100%', maxWidth: 520, borderRadius: 28, paddingBottom: 20 },
   detailHandle: { width: 38, height: 4, borderRadius: 2, backgroundColor: '#CBD0CA', alignSelf: 'center', marginBottom: 17 },
@@ -870,7 +959,7 @@ const styles = StyleSheet.create({
   deleteButton: { paddingHorizontal: 17, minHeight: 46, borderRadius: 15, backgroundColor: '#F4E5E3', alignItems: 'center', justifyContent: 'center' },
   deleteText: { color: COLORS.danger, fontWeight: '800' },
   permissionBannerWide: { left: 436, right: 18 },
-  permissionBanner: { position: 'absolute', left: 18, right: 18, top: TOP_INSET + 56, backgroundColor: '#FFF7DF', borderRadius: 14, padding: 10, borderWidth: 1, borderColor: '#E9D8A7' },
+  permissionBanner: { position: 'absolute', left: 18, right: 18, backgroundColor: '#FFF7DF', borderRadius: 14, padding: 10, borderWidth: 1, borderColor: '#E9D8A7' },
   permissionText: { fontSize: 11, lineHeight: 16, color: '#6F5725', textAlign: 'center', fontWeight: '600' },
   toast: {
     position: 'absolute', alignSelf: 'center', maxWidth: 420, marginHorizontal: 18,

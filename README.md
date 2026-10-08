@@ -38,6 +38,13 @@ the free OpenFreeMap style without one. Routes are stored in localStorage (`src/
 sheet on phones and a side panel on screens 768px and wider. `vercel.json` is set up to deploy `dist/` as a
 single-page app. Browser location needs HTTPS (or localhost).
 
+### Install as an app (PWA)
+
+The web build is installable: `public/manifest.webmanifest` and `public/icons/` provide the app name and icons,
+`public/sw.js` caches the app so it opens offline, and `public/index.html` adds the iOS home-screen tags. On iPhone,
+open the site in Safari → Share → Add to Home Screen; on Android, Chrome offers Install app. Map tiles and walking
+routes still need a connection. When changing `public/sw.js`, bump its `CACHE` name so installed copies refresh.
+
 ## Features
 
 - Live foreground location

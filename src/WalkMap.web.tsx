@@ -99,6 +99,18 @@ const WalkMap = forwardRef<WalkMapHandle, WalkMapProps>(function WalkMap(
     });
     mapRef.current = map;
 
+    // The Mapbox token is URL-restricted to the production domain, so previews and local dev get 401/403.
+    // Fall back to the free style instead of showing a blank map.
+    let fellBack = false;
+    map.on('error', (e) => {
+      const status = (e.error as { status?: number } | undefined)?.status;
+      if (MAPBOX_TOKEN && !fellBack && (status === 401 || status === 403)) {
+        fellBack = true;
+        console.warn('Mapbox token rejected on this domain; using the OpenFreeMap style instead.');
+        map.setStyle(FALLBACK_STYLE, { diff: false });
+      }
+    });
+
     map.on('click', (e) => onPressRef.current({ latitude: e.lngLat.lat, longitude: e.lngLat.lng }));
     map.on('load', () => {
       map.addSource(ROUTE_SOURCE, { type: 'geojson', data: routeData(geometryRef.current) });
