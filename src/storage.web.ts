@@ -1,10 +1,11 @@
-import type { NewRouteRecord, Profile, RouteRecord } from './types';
+import type { NewRouteRecord, Profile, RouteRecord, Session } from './types';
 
 // Web storage backed by localStorage. expo-sqlite on web needs a WASM build plus
 // cross-origin-isolation headers that would block the OpenStreetMap tiles.
 
 const KEY = 'walkexplore.routes.v1';
 const PROFILE_KEY = 'walkexplore.profile.v1';
+const SESSION_KEY = 'walkexplore.session.v1';
 
 function read(): RouteRecord[] {
   try {
@@ -39,19 +40,41 @@ export async function deleteRoute(id: number) {
   write(read().filter((r) => r.id !== id));
 }
 
-export async function loadProfile(): Promise<Profile | null> {
+/** Removes every route stored on this device (after they've been moved into an account). */
+export async function clearRoutes() {
+  write([]);
+}
+
+function getItem<T>(key: string): T | null {
   try {
-    const raw = window.localStorage.getItem(PROFILE_KEY);
-    return raw ? (JSON.parse(raw) as Profile) : null;
+    const raw = window.localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : null;
   } catch {
     return null;
   }
 }
 
-export async function saveProfile(profile: Profile) {
+function setItem(key: string, value: unknown) {
   try {
-    window.localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+    if (value === null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, JSON.stringify(value));
   } catch {
-    // Storage unavailable; the choice lasts for this session only.
+    // Storage unavailable (private mode / quota); the value lasts for this session only.
   }
+}
+
+export async function loadProfile() {
+  return getItem<Profile>(PROFILE_KEY);
+}
+
+export async function saveProfile(profile: Profile) {
+  setItem(PROFILE_KEY, profile);
+}
+
+export async function loadSession() {
+  return getItem<Session>(SESSION_KEY);
+}
+
+export async function saveSession(session: Session | null) {
+  setItem(SESSION_KEY, session);
 }

@@ -65,3 +65,16 @@ first time a route has two or more stops, the app asks for the user's weight in 
 average. Tap the calorie figure or the note under the stats to change it. The weight is stored on the device only
 (SQLite `settings` table natively, localStorage on the web), and calories for saved walks are recalculated with the
 current weight. These are planning estimates, not measurements.
+
+## Accounts and sync
+People can create an account with a random username and a 6-digit PIN (Profile tab). Signed-in walks and weight
+are stored in Neon Postgres through Vercel Functions in `api/`; signed-out use stays on the device. On first sign-in,
+walks saved on the device move into the account.
+
+- Schema: `db/schema.sql`. Apply with `npm run db:migrate` (reads `NEON_DATABASE_URL` from `.env`; safe to re-run).
+- Server-only env vars (set both in Vercel): `NEON_DATABASE_URL`, `AUTH_PEPPER`. Never change `AUTH_PEPPER` once
+  users exist, or every PIN stops working.
+- PINs: scrypt with a per-user salt plus the pepper; trivially guessable PINs are rejected. Every 5th wrong PIN locks
+  the account (15 min, doubling up to 24 h), and an IP is limited to 20 failed sign-ins per 15 minutes and 10 sign-ups
+  per hour. There is no PIN reset.
+- Native builds call the deployed API at `EXPO_PUBLIC_API_URL` (defaults to https://explore-app-three.vercel.app).

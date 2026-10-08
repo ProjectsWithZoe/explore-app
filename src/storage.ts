@@ -1,5 +1,5 @@
 import * as SQLite from 'expo-sqlite';
-import type { NewRouteRecord, Profile, RouteRecord } from './types';
+import type { NewRouteRecord, Profile, RouteRecord, Session } from './types';
 
 // Native storage backed by Expo SQLite.
 
@@ -78,17 +78,32 @@ export async function deleteRoute(id: number) {
   await db.runAsync('DELETE FROM routes WHERE id = ?', id);
 }
 
-export async function loadProfile(): Promise<Profile | null> {
+/** Removes every route stored on this device (after they've been moved into an account). */
+export async function clearRoutes() {
   const db = await getDb();
-  const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM settings WHERE key = ?', 'profile');
-  return row ? (JSON.parse(row.value) as Profile) : null;
+  await db.runAsync('DELETE FROM routes');
 }
 
-export async function saveProfile(profile: Profile) {
+async function getSetting<T>(key: string): Promise<T | null> {
   const db = await getDb();
+  const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM settings WHERE key = ?', key);
+  return row ? (JSON.parse(row.value) as T) : null;
+}
+
+async function setSetting(key: string, value: unknown) {
+  const db = await getDb();
+  if (value === null) {
+    await db.runAsync('DELETE FROM settings WHERE key = ?', key);
+    return;
+  }
   await db.runAsync(
     'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-    'profile',
-    JSON.stringify(profile),
+    key,
+    JSON.stringify(value),
   );
 }
+
+export const loadProfile = () => getSetting<Profile>('profile');
+export const saveProfile = (profile: Profile) => setSetting('profile', profile);
+export const loadSession = () => getSetting<Session>('session');
+export const saveSession = (session: Session | null) => setSetting('session', session);

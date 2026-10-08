@@ -16,8 +16,9 @@ import {
 import * as Location from 'expo-location';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import WalkMap from './src/WalkMap';
-import { deleteRoute, insertRoute, listRoutes, loadProfile, saveProfile } from './src/storage';
-import type { Coordinate, Profile, Region, RoutePoint, RouteRecord, WalkMapHandle, WeightUnit } from './src/types';
+import { clearRoutes, deleteRoute, insertRoute, listRoutes, loadProfile, loadSession, saveProfile, saveSession } from './src/storage';
+import { ApiError, api, pinProblem, randomUsername } from './src/api';
+import type { Coordinate, NewRouteRecord, Profile, Region, RoutePoint, RouteRecord, Session, WalkMapHandle, WeightUnit } from './src/types';
 
 const COLORS = {
   ink: '#17231D',
@@ -60,6 +61,8 @@ function estimatedStepsForDistance(km: number) {
   // Planning estimate only: roughly 1,400 steps per kilometre.
   return Math.max(0, Math.round(km * 1400));
 }
+
+type Tab = 'plan' | 'routes' | 'profile';
 
 const AVERAGE_WEIGHT_KG = 70;
 const KG_PER_LB = 0.45359237;
@@ -187,10 +190,20 @@ function WalkExplore() {
   const [panelHeight, setPanelHeight] = useState(360);
   const [toast, setToast] = useState<{ title: string; message: string } | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Signed-in account (null = using this device only). A ref too, so async callbacks see the latest value.
+  const [session, setSession] = useState<Session | null>(null);
+  const sessionRef = useRef<Session | null>(null);
+  const [authMode, setAuthMode] = useState<'signup' | 'login' | null>(null);
+  const [authUsername, setAuthUsername] = useState('');
+  const [authPin, setAuthPin] = useState('');
+  const [authPinConfirm, setAuthPinConfirm] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const centeredOnUser = useRef(false);
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
   const [permissionDenied, setPermissionDenied] = useState(false);
-  const [tab, setTab] = useState<'plan' | 'routes'>('plan');
+  const [tab, setTab] = useState<Tab>('plan');
   const [panelCollapsed, setPanelCollapsed] = useState(false);
   // Only the phone bottom sheet can be minimised; the desktop side panel doesn't cover the map.
   const collapsed = panelCollapsed && !isWide;
@@ -233,8 +246,7 @@ function WalkExplore() {
 
   useEffect(() => {
     let mounted = true;
-    loadRecords();
-    loadProfile().then(setProfile).catch(() => setProfile(null));
+    restoreSession();
     (async () => {
       try {
         const { status } = await Location.requestForegroundPermissionsAsync();
@@ -353,10 +365,131 @@ function WalkExplore() {
     setProfile(next);
     setShowWeightModal(false);
     try {
-      await saveProfile(next);
+      const s = sessionRef.current;
+      if (s) await api.saveProfile(s.token, next);
+      else await saveProfile(next);
     } catch (e) {
       console.warn(e);
+      notify('Weight not saved', e instanceof ApiError ? e.message : 'Something went wrong saving your weight.');
     }
+  }
+
+  function applySession(next: Session | null) {
+    sessionRef.current = next;
+    setSession(next);
+  }
+
+  async function switchToDeviceData() {
+    applySession(null);
+    setProfile(await loadProfile().catch(() => null));
+    await loadRecords();
+  }
+
+  async function restoreSession() {
+    const saved = await loadSession().catch(() => null);
+    if (!saved) {
+      await switchToDeviceData();
+      return;
+    }
+    applySession(saved);
+    try {
+      const me = await api.me(saved.token);
+      setProfile(me.profile);
+      await loadRecords();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        await saveSession(null);
+        await switchToDeviceData();
+        notify('Signed out', 'Your session expired. Sign in again to see your walks.');
+      } else {
+        notify('Offline', 'Can’t reach the server right now, so your walks may be out of date.');
+      }
+    }
+  }
+
+  function openAuth(mode: 'signup' | 'login') {
+    setAuthMode(mode);
+    setAuthUsername(mode === 'signup' ? randomUsername() : '');
+    setAuthPin('');
+    setAuthPinConfirm('');
+    setAuthError('');
+  }
+
+  async function submitAuth() {
+    if (!authMode || authBusy) return;
+    const username = authUsername.trim().toLowerCase();
+    if (!username) return setAuthError('Enter your username.');
+    if (authMode === 'signup') {
+      const problem = pinProblem(authPin);
+      if (problem) return setAuthError(problem);
+      if (authPin !== authPinConfirm) return setAuthError('The two PINs don’t match.');
+    } else if (!/^\d{6}$/.test(authPin)) {
+      return setAuthError('Enter your 6-digit PIN.');
+    }
+
+    setAuthBusy(true);
+    setAuthError('');
+    try {
+      const next = authMode === 'signup' ? await api.signup(username, authPin) : await api.login(username, authPin);
+      await saveSession(next);
+      applySession(next);
+      const moved = await moveDeviceDataIntoAccount(next);
+      setAuthMode(null);
+      notify(
+        authMode === 'signup' ? 'Account created' : 'Signed in',
+        moved ? `Signed in as ${next.username}. ${moved} walk${moved === 1 ? '' : 's'} from this device moved to your account.` : `Signed in as ${next.username}.`,
+      );
+    } catch (e) {
+      setAuthError(e instanceof ApiError ? e.message : 'Something went wrong. Please try again.');
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  /** Uploads walks and weight saved on this device into the account, then loads the account's data. */
+  async function moveDeviceDataIntoAccount(next: Session) {
+    const local = await listRoutes().catch(() => [] as RouteRecord[]);
+    if (local.length) {
+      const walks: NewRouteRecord[] = local.map(({ id, ...walk }) => walk);
+      for (let i = 0; i < walks.length; i += 500) await api.addWalks(next.token, walks.slice(i, i + 500));
+      await clearRoutes();
+    }
+    const me = await api.me(next.token);
+    let accountProfile = me.profile;
+    if (!accountProfile) {
+      const localProfile = await loadProfile().catch(() => null);
+      if (localProfile) {
+        await api.saveProfile(next.token, localProfile);
+        accountProfile = localProfile;
+      }
+    }
+    setProfile(accountProfile);
+    await loadRecords();
+    return local.length;
+  }
+
+  async function signOut() {
+    const current = sessionRef.current;
+    await saveSession(null);
+    if (current) api.logout(current.token).catch(() => {});
+    setConfirmDelete(false);
+    await switchToDeviceData();
+    notify('Signed out', 'Walks you log now are saved on this device only.');
+  }
+
+  async function deleteAccount() {
+    const current = sessionRef.current;
+    if (!current) return;
+    try {
+      await api.deleteAccount(current.token);
+    } catch (e) {
+      notify('Couldn’t delete account', e instanceof ApiError ? e.message : 'Please try again.');
+      return;
+    }
+    await saveSession(null);
+    setConfirmDelete(false);
+    await switchToDeviceData();
+    notify('Account deleted', 'Your account and its walks have been removed.');
   }
 
   function submitWeight() {
@@ -377,13 +510,15 @@ function WalkExplore() {
 
   async function loadRecords() {
     try {
-      const rows = await listRoutes();
+      const s = sessionRef.current;
+      const rows = s ? await api.listWalks(s.token) : await listRoutes();
       setRecords(rows.map((row) => ({
         ...row,
         estimatedSteps: row.estimatedSteps ?? estimatedStepsForDistance(row.distanceKm),
       })));
     } catch (e) {
       console.warn(e);
+      if (e instanceof ApiError) notify('Couldn’t load walks', e.message);
     }
   }
 
@@ -446,21 +581,24 @@ function WalkExplore() {
 
   async function persistRoute(action: 'save' | 'complete') {
     const now = new Date().toISOString();
+    const walk: NewRouteRecord = {
+      name: routeName.trim() || 'Walking route',
+      createdAt: now,
+      completedAt: action === 'complete' ? now : null,
+      saved: action === 'save' ? 1 : 0,
+      distanceKm,
+      durationMin,
+      estimatedSteps,
+      points,
+      geometry: routeGeometry,
+    };
     try {
-      await insertRoute({
-        name: routeName.trim() || 'Walking route',
-        createdAt: now,
-        completedAt: action === 'complete' ? now : null,
-        saved: action === 'save' ? 1 : 0,
-        distanceKm,
-        durationMin,
-        estimatedSteps,
-        points,
-        geometry: routeGeometry,
-      });
+      const s = sessionRef.current;
+      if (s) await api.addWalks(s.token, [walk]);
+      else await insertRoute(walk);
     } catch (e) {
       console.warn(e);
-      notify('Could not save', 'Something went wrong storing this route.');
+      notify('Could not save', e instanceof ApiError ? e.message : 'Something went wrong storing this route.');
       return;
     }
     await loadRecords();
@@ -474,7 +612,14 @@ function WalkExplore() {
   }
 
   async function deleteRecord(id: number) {
-    await deleteRoute(id);
+    try {
+      const s = sessionRef.current;
+      if (s) await api.deleteWalk(s.token, id);
+      else await deleteRoute(id);
+    } catch (e) {
+      notify('Couldn’t delete', e instanceof ApiError ? e.message : 'Please try again.');
+      return;
+    }
     if (selectedRecord?.id === id) setSelectedRecord(null);
     await loadRecords();
   }
@@ -496,6 +641,7 @@ function WalkExplore() {
   const history = records.filter((r) => !!r.completedAt);
   const totalWalkedKm = history.reduce((sum, r) => sum + r.distanceKm, 0);
   const totalCalories = history.reduce((sum, r) => sum + estimatedCalories(r.durationMin, weightKg), 0);
+  const activity = useMemo(() => activityStats(history, weightKg), [history, weightKg]);
   // Five summary cards don't fit in one row on phones; wrap them into a grid.
   const summaryWraps = width < 520;
   const totalSteps = history.reduce((sum, r) => sum + (r.estimatedSteps ?? estimatedStepsForDistance(r.distanceKm)), 0);
@@ -694,21 +840,12 @@ function WalkExplore() {
             </View>
             </ScrollView>
 
-            <View style={styles.tabBar}>
-              <Pressable style={styles.tabItem} onPress={() => setTab('plan')}>
-                <Text style={[styles.tabIcon, styles.tabActive]}>⌁</Text>
-                <Text style={[styles.tabLabel, styles.tabActive]}>Plan</Text>
-              </Pressable>
-              <Pressable style={styles.tabItem} onPress={() => setTab('routes')}>
-                <Text style={styles.tabIcon}>◷</Text>
-                <Text style={styles.tabLabel}>Routes</Text>
-              </Pressable>
-            </View>
+            <TabBar active="plan" onChange={setTab} style={styles.tabBar} />
             </>
             )}
           </View>
         </View>
-      ) : (
+      ) : tab === 'routes' ? (
         <View style={[styles.routesScreen, { paddingTop: topInset }]}>
           <View style={[styles.routesHeader, styles.contentWidth]}>
             <View>
@@ -770,16 +907,84 @@ function WalkExplore() {
             )}
           </ScrollView>
 
-          <View style={[styles.routesTabBar, { paddingBottom: Math.max(9, bottomInset) }]}>
-            <Pressable style={styles.tabItem} onPress={() => setTab('plan')}>
-              <Text style={styles.tabIcon}>⌁</Text>
-              <Text style={styles.tabLabel}>Plan</Text>
-            </Pressable>
-            <Pressable style={styles.tabItem}>
-              <Text style={[styles.tabIcon, styles.tabActive]}>◷</Text>
-              <Text style={[styles.tabLabel, styles.tabActive]}>Routes</Text>
+          <TabBar active="routes" onChange={setTab} style={[styles.routesTabBar, { paddingBottom: Math.max(9, bottomInset) }]} />
+        </View>
+      ) : (
+        <View style={[styles.routesScreen, { paddingTop: topInset }]}>
+          <View style={[styles.routesHeader, styles.contentWidth]}>
+            <View>
+              <Text style={styles.eyebrow}>YOUR ACTIVITY</Text>
+              <Text style={styles.title}>Profile</Text>
+            </View>
+            <Pressable style={styles.closeButton} onPress={() => setTab('plan')}>
+              <Text style={styles.closeText}>Map</Text>
             </Pressable>
           </View>
+
+          <ScrollView contentContainerStyle={[styles.routesList, styles.contentWidth]}>
+            <View style={[styles.accountCard, styles.profileSection]}>
+              {session ? (
+                <>
+                  <View style={styles.accountRow}>
+                    <View style={styles.avatar}><Text style={styles.avatarText}>{session.username[0]?.toUpperCase()}</Text></View>
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={styles.eyebrow}>SIGNED IN AS</Text>
+                      <Text style={styles.routeName} numberOfLines={1}>{session.username}</Text>
+                    </View>
+                    <Pressable style={styles.closeButton} onPress={signOut}>
+                      <Text style={styles.closeText}>Sign out</Text>
+                    </Pressable>
+                  </View>
+                  <Text style={styles.accountNote}>Your walks sync to any device where you sign in with this username and your PIN.</Text>
+                  {confirmDelete ? (
+                    <View style={styles.deleteConfirm}>
+                      <Text style={styles.deleteConfirmText}>Permanently delete this account and all its walks? This can’t be undone.</Text>
+                      <View style={styles.modalActions}>
+                        <Pressable style={styles.cancelButton} onPress={() => setConfirmDelete(false)}>
+                          <Text style={styles.cancelText}>Keep account</Text>
+                        </Pressable>
+                        <Pressable style={[styles.deleteButton, { flex: 1 }]} onPress={deleteAccount}>
+                          <Text style={styles.deleteText}>Delete forever</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  ) : (
+                    <Pressable onPress={() => setConfirmDelete(true)} hitSlop={6} style={{ alignSelf: 'flex-start', marginTop: 10 }}>
+                      <Text style={styles.deleteLink}>Delete account</Text>
+                    </Pressable>
+                  )}
+                </>
+              ) : (
+                <>
+                  <Text style={styles.routeName}>Keep your walks safe</Text>
+                  <Text style={styles.accountNote}>
+                    Right now your walks are saved on this device only. Create an account with a username and 6-digit PIN to keep them and see them on any device.
+                  </Text>
+                  <View style={styles.modalActions}>
+                    <Pressable style={styles.secondaryButton} onPress={() => openAuth('login')}>
+                      <Text style={styles.secondaryButtonText}>Sign in</Text>
+                    </Pressable>
+                    <Pressable style={styles.primaryButton} onPress={() => openAuth('signup')}>
+                      <Text style={styles.primaryButtonText}>Create account</Text>
+                    </Pressable>
+                  </View>
+                </>
+              )}
+            </View>
+
+            <ProfileStats
+              stats={activity}
+              columns={isWide ? 3 : 2}
+              weightLabel={usingAverageWeight
+                ? `${formatWeight(AVERAGE_WEIGHT_KG, profile?.unit ?? 'kg')} average`
+                : formatWeight(weightKg, profile?.unit ?? 'kg')}
+              usingAverageWeight={usingAverageWeight}
+              onChangeWeight={openWeightModal}
+              onPlan={() => setTab('plan')}
+            />
+          </ScrollView>
+
+          <TabBar active="profile" onChange={setTab} style={[styles.routesTabBar, { paddingBottom: Math.max(9, bottomInset) }]} />
         </View>
       )}
 
@@ -859,6 +1064,107 @@ function WalkExplore() {
         </KeyboardAvoidingView>
       </Modal>
 
+      <Modal visible={!!authMode} transparent animationType="fade" onRequestClose={() => !authBusy && setAuthMode(null)}>
+        <KeyboardAvoidingView style={[styles.modalBackdrop, isWide && styles.modalBackdropWide]} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>{authMode === 'signup' ? 'Create an account' : 'Sign in'}</Text>
+            <Text style={styles.modalSubtitle}>
+              {authMode === 'signup'
+                ? 'Here’s a random username. Shuffle it or type your own. There’s no PIN reset, so keep your username and PIN somewhere safe.'
+                : 'Enter your username and 6-digit PIN.'}
+            </Text>
+
+            <Text style={styles.fieldLabel}>Username</Text>
+            <View style={styles.weightRow}>
+              <TextInput
+                value={authUsername}
+                onChangeText={(t) => { setAuthUsername(t.toLowerCase()); setAuthError(''); }}
+                placeholder="e.g. brisk-otter-4821"
+                placeholderTextColor="#9AA29C"
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoComplete="username"
+                textContentType="username"
+                maxLength={30}
+                style={[styles.nameInput, styles.weightInput]}
+                accessibilityLabel="Username"
+              />
+              {authMode === 'signup' && (
+                <Pressable
+                  style={styles.shuffleButton}
+                  onPress={() => setAuthUsername(randomUsername())}
+                  accessibilityRole="button"
+                  accessibilityLabel="Suggest another username"
+                >
+                  <Text style={styles.shuffleText}>↻</Text>
+                </Pressable>
+              )}
+            </View>
+
+            <Text style={styles.fieldLabel}>{authMode === 'signup' ? 'Choose a 6-digit PIN' : 'PIN'}</Text>
+            <TextInput
+              value={authPin}
+              onChangeText={(t) => { setAuthPin(t.replace(/\D/g, '').slice(0, 6)); setAuthError(''); }}
+              placeholder="••••••"
+              placeholderTextColor="#9AA29C"
+              secureTextEntry
+              keyboardType="number-pad"
+              inputMode="numeric"
+              maxLength={6}
+              autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'}
+              textContentType={authMode === 'signup' ? 'newPassword' : 'password'}
+              onSubmitEditing={authMode === 'login' ? submitAuth : undefined}
+              style={[styles.nameInput, styles.pinInput]}
+              accessibilityLabel="6-digit PIN"
+            />
+            {authMode === 'signup' && (
+              <>
+                <Text style={styles.fieldLabel}>Confirm PIN</Text>
+                <TextInput
+                  value={authPinConfirm}
+                  onChangeText={(t) => { setAuthPinConfirm(t.replace(/\D/g, '').slice(0, 6)); setAuthError(''); }}
+                  placeholder="••••••"
+                  placeholderTextColor="#9AA29C"
+                  secureTextEntry
+                  keyboardType="number-pad"
+                  inputMode="numeric"
+                  maxLength={6}
+                  autoComplete="new-password"
+                  textContentType="newPassword"
+                  onSubmitEditing={submitAuth}
+                  style={[styles.nameInput, styles.pinInput]}
+                  accessibilityLabel="Confirm PIN"
+                />
+              </>
+            )}
+
+            {authError ? <Text style={styles.weightError}>{authError}</Text> : null}
+
+            <View style={styles.weightActions}>
+              <Pressable style={[styles.primaryButton, authBusy && { opacity: 0.6 }]} onPress={submitAuth} disabled={authBusy}>
+                <Text style={styles.primaryButtonText}>
+                  {authBusy ? 'Please wait…' : authMode === 'signup' ? 'Create account' : 'Sign in'}
+                </Text>
+              </Pressable>
+              <Pressable style={styles.cancelButton} onPress={() => setAuthMode(null)} disabled={authBusy}>
+                <Text style={styles.cancelText}>Cancel</Text>
+              </Pressable>
+            </View>
+            <Pressable
+              onPress={() => openAuth(authMode === 'signup' ? 'login' : 'signup')}
+              disabled={authBusy}
+              style={{ alignSelf: 'center', marginTop: 12 }}
+              hitSlop={6}
+            >
+              <Text style={styles.calorieNoteText}>
+                {authMode === 'signup' ? 'Already have an account? ' : 'New here? '}
+                <Text style={styles.calorieNoteLink}>{authMode === 'signup' ? 'Sign in' : 'Create an account'}</Text>
+              </Text>
+            </Pressable>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
       <Modal visible={!!selectedRecord} transparent animationType="slide" onRequestClose={() => setSelectedRecord(null)}>
         {selectedRecord && (
           <View style={[styles.detailBackdrop, isWide && styles.detailBackdropWide]}>
@@ -907,6 +1213,190 @@ function WalkExplore() {
           <Text style={styles.toastText}>{toast.message}</Text>
         </View>
       )}
+    </View>
+  );
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function startOfDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+}
+
+type ActivityWindow = { label: string; walks: number; steps: number; calories: number };
+type ActivityStats = ReturnType<typeof activityStats>;
+
+function activityStats(history: RouteRecord[], weightKg: number, now = new Date()) {
+  const walks = history
+    .filter((r) => !!r.completedAt)
+    .map((r) => ({
+      at: new Date(r.completedAt!).getTime(),
+      km: r.distanceKm,
+      min: r.durationMin,
+      steps: r.estimatedSteps ?? estimatedStepsForDistance(r.distanceKm),
+      calories: estimatedCalories(r.durationMin, weightKg),
+    }));
+  const today = startOfDay(now);
+  const firstWalk = walks.length ? Math.min(...walks.map((w) => w.at)) : null;
+  // Calendar days from the first logged walk up to and including today.
+  const daysTracked = firstWalk === null ? 0 : Math.max(1, Math.round((today - startOfDay(new Date(firstWalk))) / DAY_MS) + 1);
+  const n = walks.length;
+
+  const summarise = (label: string, since: number): ActivityWindow => {
+    const inWindow = walks.filter((w) => w.at >= since);
+    return {
+      label,
+      walks: inWindow.length,
+      steps: inWindow.reduce((sum, w) => sum + w.steps, 0),
+      calories: inWindow.reduce((sum, w) => sum + w.calories, 0),
+    };
+  };
+
+  const totalSteps = walks.reduce((sum, w) => sum + w.steps, 0);
+  return {
+    walks: n,
+    firstWalk,
+    // A week or month that hasn't fully elapsed yet counts as one, so a first walk reads as 1/week, not 7/week.
+    perDay: daysTracked ? n / daysTracked : 0,
+    perWeek: daysTracked ? n / Math.max(1, daysTracked / 7) : 0,
+    perMonth: daysTracked ? n / Math.max(1, daysTracked / 30.44) : 0,
+    distanceKm: walks.reduce((sum, w) => sum + w.km, 0),
+    durationMin: walks.reduce((sum, w) => sum + w.min, 0),
+    steps: totalSteps,
+    calories: walks.reduce((sum, w) => sum + w.calories, 0),
+    stepsPerWalk: n ? Math.round(totalSteps / n) : 0,
+    recent: [
+      summarise('Today', today),
+      summarise('Last 7 days', today - 6 * DAY_MS),
+      summarise('Last 30 days', today - 29 * DAY_MS),
+    ],
+  };
+}
+
+function formatAverage(value: number) {
+  if (value === 0) return '0';
+  return value < 10 ? value.toFixed(1).replace(/\.0$/, '') : Math.round(value).toLocaleString();
+}
+
+function ProfileStats({
+  stats,
+  columns,
+  weightLabel,
+  usingAverageWeight,
+  onChangeWeight,
+  onPlan,
+}: {
+  stats: ActivityStats;
+  columns: 2 | 3;
+  weightLabel: string;
+  usingAverageWeight: boolean;
+  onChangeWeight: () => void;
+  onPlan: () => void;
+}) {
+  const cell = { flexBasis: columns === 3 ? '31%' : '46%' } as const;
+  const tile = (value: string, label: string) => (
+    <View key={label} style={[styles.statTile, cell]}>
+      <Text style={styles.summaryValue} numberOfLines={1}>{value}</Text>
+      <Text style={styles.summaryLabel}>{label}</Text>
+    </View>
+  );
+
+  return (
+    <>
+      {stats.walks === 0 ? (
+        <View style={styles.emptyCard}>
+          <Text style={styles.emptyIcon}>◌</Text>
+          <Text style={styles.emptyTitle}>No activity yet</Text>
+          <Text style={styles.emptyText}>Log a walk and your averages, steps and calories will show up here.</Text>
+          <Pressable style={styles.primaryButtonSmall} onPress={onPlan}>
+            <Text style={styles.primaryButtonText}>Plan a walk</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <>
+          <Text style={styles.sectionTitle}>Average walks</Text>
+          <View style={styles.averagesCard}>
+            {[
+              { value: stats.perDay, unit: 'per day' },
+              { value: stats.perWeek, unit: 'per week' },
+              { value: stats.perMonth, unit: 'per month' },
+            ].map((a, i) => (
+              <React.Fragment key={a.unit}>
+                {i > 0 && <View style={styles.statDivider} />}
+                <View style={styles.averageItem}>
+                  <Text style={styles.averageValue}>{formatAverage(a.value)}</Text>
+                  <Text style={styles.summaryLabel}>{a.unit}</Text>
+                </View>
+              </React.Fragment>
+            ))}
+          </View>
+          {stats.firstWalk !== null && (
+            <Text style={styles.statsFootnote}>
+              Since your first logged walk on {new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' }).format(stats.firstWalk)}
+            </Text>
+          )}
+
+          <Text style={[styles.sectionTitle, styles.sectionSpacing]}>Totals</Text>
+          <View style={styles.statGrid}>
+            {tile(stats.walks.toLocaleString(), 'Walks done')}
+            {tile(formatDistance(stats.distanceKm), 'Distance')}
+            {tile(stats.steps.toLocaleString(), 'Est. steps')}
+            {tile(stats.calories.toLocaleString(), 'Est. kcal')}
+            {tile(formatDuration(stats.durationMin), 'Time walking')}
+            {tile(stats.stepsPerWalk.toLocaleString(), 'Avg steps per walk')}
+          </View>
+
+          <Text style={[styles.sectionTitle, styles.sectionSpacing]}>Recent</Text>
+          <View style={styles.recentCard}>
+            {stats.recent.map((w, i) => (
+              <View key={w.label} style={[styles.recentRow, i > 0 && styles.recentRowBorder]}>
+                <Text style={styles.recentLabel}>{w.label}</Text>
+                <Text style={styles.recentValue} numberOfLines={1}>
+                  {w.walks} {w.walks === 1 ? 'walk' : 'walks'} · {w.steps.toLocaleString()} steps · {w.calories.toLocaleString()} kcal
+                </Text>
+              </View>
+            ))}
+          </View>
+        </>
+      )}
+
+      <Text style={[styles.sectionTitle, styles.sectionSpacing]}>Your weight</Text>
+      <View style={styles.weightCard}>
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text style={styles.routeName}>{weightLabel}</Text>
+          <Text style={styles.routeMeta}>
+            {usingAverageWeight ? 'Add your weight for more accurate calories.' : 'Used for calorie estimates.'} Stored on this device only.
+          </Text>
+        </View>
+        <Pressable style={styles.closeButton} onPress={onChangeWeight}>
+          <Text style={styles.closeText}>{usingAverageWeight ? 'Add' : 'Change'}</Text>
+        </Pressable>
+      </View>
+    </>
+  );
+}
+
+const TABS: { key: Tab; icon: string; label: string }[] = [
+  { key: 'plan', icon: '⌁', label: 'Plan' },
+  { key: 'routes', icon: '◷', label: 'Routes' },
+  { key: 'profile', icon: '◉', label: 'Profile' },
+];
+
+function TabBar({ active, onChange, style }: { active: Tab; onChange: (tab: Tab) => void; style: any }) {
+  return (
+    <View style={style}>
+      {TABS.map((t) => (
+        <Pressable
+          key={t.key}
+          style={styles.tabItem}
+          onPress={() => onChange(t.key)}
+          accessibilityRole="tab"
+          accessibilityState={{ selected: active === t.key }}
+        >
+          <Text style={[styles.tabIcon, active === t.key && styles.tabActive]}>{t.icon}</Text>
+          <Text style={[styles.tabLabel, active === t.key && styles.tabActive]}>{t.label}</Text>
+        </Pressable>
+      ))}
     </View>
   );
 }
@@ -1040,6 +1530,22 @@ const styles = StyleSheet.create({
   unitText: { fontSize: 14, fontWeight: '800', color: COLORS.muted },
   unitTextActive: { color: COLORS.white },
   weightActions: { gap: 8, marginTop: 14 },
+  profileSection: { marginBottom: 24 },
+  accountCard: { backgroundColor: COLORS.card, borderRadius: 18, borderWidth: 1, borderColor: COLORS.line, padding: 15 },
+  accountRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  avatar: { width: 42, height: 42, borderRadius: 21, backgroundColor: COLORS.accent, alignItems: 'center', justifyContent: 'center' },
+  avatarText: { color: COLORS.white, fontSize: 18, fontWeight: '800' },
+  accountNote: { fontSize: 12, lineHeight: 17, color: COLORS.muted, marginTop: 8 },
+  deleteLink: { fontSize: 12, fontWeight: '700', color: COLORS.danger },
+  deleteConfirm: { marginTop: 12, padding: 12, borderRadius: 14, backgroundColor: '#FBF1EF' },
+  deleteConfirmText: { fontSize: 12, lineHeight: 17, color: COLORS.danger, fontWeight: '600' },
+  fieldLabel: { fontSize: 11, fontWeight: '800', letterSpacing: 0.6, color: COLORS.muted, marginBottom: 6, marginTop: 12, textTransform: 'uppercase' },
+  pinInput: { letterSpacing: 6, fontSize: 18 },
+  shuffleButton: {
+    width: 48, height: 48, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, backgroundColor: COLORS.bg,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  shuffleText: { fontSize: 20, color: COLORS.ink, fontWeight: '700' },
   weightError: { fontSize: 12, color: COLORS.danger, marginTop: 8 },
   statLabel: { fontSize: 8.5, fontWeight: '800', letterSpacing: 1, color: COLORS.muted, marginBottom: 2 },
   distance: { fontSize: 20, fontWeight: '800', color: COLORS.ink, letterSpacing: -0.5 },
@@ -1073,8 +1579,27 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18, paddingTop: 8,
     borderTopWidth: 1, borderTopColor: COLORS.line, flexDirection: 'row', justifyContent: 'space-around', backgroundColor: COLORS.bg,
   },
-  tabItem: { alignItems: 'center', minWidth: 80 },
-  tabIcon: { fontSize: 20, color: '#9AA29C', marginBottom: 1 },
+  tabItem: { alignItems: 'center', minWidth: 72 },
+  sectionSpacing: { marginTop: 24 },
+  averagesCard: {
+    flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.card, borderRadius: 18,
+    paddingVertical: 15, paddingHorizontal: 12, borderWidth: 1, borderColor: COLORS.line,
+  },
+  averageItem: { flex: 1, alignItems: 'center' },
+  averageValue: { fontSize: 24, fontWeight: '800', color: COLORS.accent, letterSpacing: -0.5 },
+  statsFootnote: { fontSize: 11, color: COLORS.muted, marginTop: 7 },
+  statGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  statTile: { flexGrow: 1, backgroundColor: COLORS.card, borderRadius: 17, padding: 13, borderWidth: 1, borderColor: COLORS.line },
+  recentCard: { backgroundColor: COLORS.card, borderRadius: 18, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 14 },
+  recentRow: { paddingVertical: 12 },
+  recentRowBorder: { borderTopWidth: 1, borderTopColor: COLORS.line },
+  recentLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 1, color: COLORS.muted, textTransform: 'uppercase' },
+  recentValue: { fontSize: 14, fontWeight: '700', color: COLORS.ink, marginTop: 3 },
+  weightCard: {
+    flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: COLORS.card, borderRadius: 18,
+    padding: 14, borderWidth: 1, borderColor: COLORS.line,
+  },
+  tabIcon: { fontSize: 20, lineHeight: 24, height: 24, color: '#9AA29C', marginBottom: 1, textAlign: 'center' },
   tabLabel: { fontSize: 10, color: '#8B938D', fontWeight: '700' },
   tabActive: { color: COLORS.accent },
   routesHeader: { paddingHorizontal: 20, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },

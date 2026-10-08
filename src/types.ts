@@ -37,3 +37,5 @@ export type Profile = {
   weightKg: number | null;
   unit: WeightUnit;
 };
+
+export type Session = { token: string; username: string };
