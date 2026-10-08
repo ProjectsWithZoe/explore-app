@@ -16,8 +16,8 @@ import {
 import * as Location from 'expo-location';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import WalkMap from './src/WalkMap';
-import { deleteRoute, insertRoute, listRoutes } from './src/storage';
-import type { Coordinate, Region, RoutePoint, RouteRecord, WalkMapHandle } from './src/types';
+import { deleteRoute, insertRoute, listRoutes, loadProfile, saveProfile } from './src/storage';
+import type { Coordinate, Profile, Region, RoutePoint, RouteRecord, WalkMapHandle, WeightUnit } from './src/types';
 
 const COLORS = {
   ink: '#17231D',
@@ -59,6 +59,20 @@ function estimatedStepsForDistance(km: number) {
   if (!Number.isFinite(km) || km <= 0) return 0;
   // Planning estimate only: roughly 1,400 steps per kilometre.
   return Math.max(0, Math.round(km * 1400));
+}
+
+const AVERAGE_WEIGHT_KG = 70;
+const KG_PER_LB = 0.45359237;
+// Walking at a moderate pace (~5 km/h) is about 3.5 METs; kcal = MET × kg × hours.
+const WALKING_MET = 3.5;
+
+function estimatedCalories(durationMin: number, weightKg: number) {
+  if (!Number.isFinite(durationMin) || durationMin <= 0) return 0;
+  return Math.round(WALKING_MET * weightKg * (durationMin / 60));
+}
+
+function formatWeight(kg: number, unit: WeightUnit) {
+  return unit === 'lb' ? `${Math.round(kg / KG_PER_LB)} lb` : `${Math.round(kg)} kg`;
 }
 
 function formatSteps(steps: number) {
@@ -193,6 +207,15 @@ function WalkExplore() {
   const [pendingAction, setPendingAction] = useState<'save' | 'complete' | null>(null);
   const [records, setRecords] = useState<RouteRecord[]>([]);
   const [selectedRecord, setSelectedRecord] = useState<RouteRecord | null>(null);
+  // undefined = still loading, null = never asked.
+  const [profile, setProfile] = useState<Profile | null | undefined>(undefined);
+  const [showWeightModal, setShowWeightModal] = useState(false);
+  const [weightInput, setWeightInput] = useState('');
+  const [weightUnit, setWeightUnit] = useState<WeightUnit>('kg');
+  const [weightError, setWeightError] = useState('');
+  const weightKg = profile?.weightKg ?? AVERAGE_WEIGHT_KG;
+  const usingAverageWeight = !profile?.weightKg;
+  const calories = estimatedCalories(durationMin, weightKg);
 
   const userCoordinate: Coordinate | null = location
     ? { latitude: location.coords.latitude, longitude: location.coords.longitude }
@@ -211,6 +234,7 @@ function WalkExplore() {
   useEffect(() => {
     let mounted = true;
     loadRecords();
+    loadProfile().then(setProfile).catch(() => setProfile(null));
     (async () => {
       try {
         const { status } = await Location.requestForegroundPermissionsAsync();
@@ -232,6 +256,11 @@ function WalkExplore() {
       if (toastTimer.current) clearTimeout(toastTimer.current);
     };
   }, []);
+
+  // Ask for a weight once, the first time a route has a calorie estimate to show.
+  useEffect(() => {
+    if (profile === null && points.length > 1 && !showNameModal) openWeightModal();
+  }, [profile, points.length]);
 
   // The map mounts before the location fix arrives, so jump to the user once it does.
   useEffect(() => {
@@ -302,6 +331,43 @@ function WalkExplore() {
       else if (Math.abs(g.dy) < 6 && Math.abs(g.dx) < 6) setPanelCollapsed((c) => !c);
     },
   }), []);
+
+  function openWeightModal() {
+    const unit = profile?.unit ?? 'kg';
+    setWeightUnit(unit);
+    setWeightInput(profile?.weightKg ? String(Math.round(unit === 'lb' ? profile.weightKg / KG_PER_LB : profile.weightKg)) : '');
+    setWeightError('');
+    setShowWeightModal(true);
+  }
+
+  function changeWeightUnit(unit: WeightUnit) {
+    if (unit === weightUnit) return;
+    const value = parseFloat(weightInput.replace(',', '.'));
+    if (Number.isFinite(value) && value > 0) {
+      setWeightInput(String(Math.round(unit === 'lb' ? value / KG_PER_LB : value * KG_PER_LB)));
+    }
+    setWeightUnit(unit);
+  }
+
+  async function storeProfile(next: Profile) {
+    setProfile(next);
+    setShowWeightModal(false);
+    try {
+      await saveProfile(next);
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
+  function submitWeight() {
+    const value = parseFloat(weightInput.replace(',', '.'));
+    const kg = weightUnit === 'lb' ? value * KG_PER_LB : value;
+    if (!Number.isFinite(kg) || kg < 25 || kg > 300) {
+      setWeightError(weightUnit === 'lb' ? 'Enter a weight between 55 and 660 lb.' : 'Enter a weight between 25 and 300 kg.');
+      return;
+    }
+    storeProfile({ weightKg: Math.round(kg * 10) / 10, unit: weightUnit });
+  }
 
   function notify(title: string, message: string) {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -429,6 +495,9 @@ function WalkExplore() {
   const saved = records.filter((r) => r.saved === 1 && !r.completedAt);
   const history = records.filter((r) => !!r.completedAt);
   const totalWalkedKm = history.reduce((sum, r) => sum + r.distanceKm, 0);
+  const totalCalories = history.reduce((sum, r) => sum + estimatedCalories(r.durationMin, weightKg), 0);
+  // Five summary cards don't fit in one row on phones; wrap them into a grid.
+  const summaryWraps = width < 520;
   const totalSteps = history.reduce((sum, r) => sum + (r.estimatedSteps ?? estimatedStepsForDistance(r.distanceKm)), 0);
 
   return (
@@ -489,14 +558,23 @@ function WalkExplore() {
                 {collapsed && (
                   <Pressable style={styles.collapsedRow} onPress={() => setPanelCollapsed(false)}>
                     <View style={{ flex: 1, minWidth: 0 }}>
-                      <Text style={styles.eyebrow}>ROUTE PLANNER</Text>
-                      <Text style={styles.collapsedSummary} numberOfLines={1}>
-                        {points.length > 1
-                          ? `${formatDistance(distanceKm)} · ${formatDuration(durationMin)} · ${estimatedSteps.toLocaleString()} steps`
-                          : points.length === 1
-                            ? 'Start set. Tap the map to add a stop'
-                            : 'Tap the map to start a walk'}
-                      </Text>
+                      {points.length > 1 ? (
+                        <>
+                          <Text style={styles.collapsedSummary} numberOfLines={1}>
+                            {formatDistance(distanceKm)} · {formatDuration(durationMin)}
+                          </Text>
+                          <Text style={styles.collapsedDetail} numberOfLines={1}>
+                            {estimatedSteps.toLocaleString()} steps · {calories.toLocaleString()} kcal
+                          </Text>
+                        </>
+                      ) : (
+                        <>
+                          <Text style={styles.eyebrow}>ROUTE PLANNER</Text>
+                          <Text style={styles.collapsedSummary} numberOfLines={1}>
+                            {points.length === 1 ? 'Start set. Tap the map to add a stop' : 'Tap the map to start a walk'}
+                          </Text>
+                        </>
+                      )}
                     </View>
                     <View style={styles.collapsedButton}>
                       <Text style={styles.collapsedButtonText}>Show ⌃</Text>
@@ -533,9 +611,13 @@ function WalkExplore() {
               </View>
             </View>
 
-            <Text style={styles.helper}>
-              Tap anywhere on the map to add your next stop.
-            </Text>
+            <View style={styles.helperRow}>
+              <Text style={styles.helper}>Tap anywhere on the map to add your next stop.</Text>
+              <View style={styles.routeStatus}>
+                <View style={[styles.statusDot, routing && styles.statusDotBusy]} />
+                <Text style={styles.statusText}>{routing ? 'Routing…' : points.length > 1 ? 'Walkable' : 'Ready'}</Text>
+              </View>
+            </View>
 
             {points.length > 0 && (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.pointsRow}>
@@ -554,25 +636,40 @@ function WalkExplore() {
             )}
 
             <View style={[styles.statsCard, isCompact && styles.statsCardCompact]}>
-              <View>
-                <Text style={styles.statLabel}>WALKING DISTANCE</Text>
-                <Text style={[styles.distance, isCompact && styles.distanceCompact]}>{formatDistance(distanceKm)}</Text>
+              <View style={styles.stat}>
+                <Text style={styles.statLabel} numberOfLines={1}>DISTANCE</Text>
+                <Text style={[styles.distance, isCompact && styles.distanceCompact]} numberOfLines={1}>{formatDistance(distanceKm)}</Text>
               </View>
               <View style={[styles.statDivider, isCompact && styles.statDividerCompact]} />
-              <View>
-                <Text style={styles.statLabel}>EST. TIME</Text>
-                <Text style={styles.time}>{formatDuration(durationMin)}</Text>
+              <View style={styles.stat}>
+                <Text style={styles.statLabel} numberOfLines={1}>TIME</Text>
+                <Text style={[styles.time, isCompact && styles.timeCompact]} numberOfLines={1}>{formatDuration(durationMin)}</Text>
               </View>
               <View style={[styles.statDivider, isCompact && styles.statDividerCompact]} />
-              <View>
-                <Text style={styles.statLabel}>EST. STEPS</Text>
-                <Text style={styles.time}>{estimatedSteps.toLocaleString()}</Text>
+              <View style={styles.stat}>
+                <Text style={styles.statLabel} numberOfLines={1}>STEPS</Text>
+                <Text style={[styles.time, isCompact && styles.timeCompact]} numberOfLines={1}>{estimatedSteps.toLocaleString()}</Text>
               </View>
-              <View style={styles.routeStatus}>
-                <View style={[styles.statusDot, routing && styles.statusDotBusy]} />
-                <Text style={styles.statusText}>{routing ? 'Routing…' : points.length > 1 ? 'Walkable' : 'Ready'}</Text>
-              </View>
+              <View style={[styles.statDivider, isCompact && styles.statDividerCompact]} />
+              <Pressable
+                style={styles.stat}
+                onPress={openWeightModal}
+                accessibilityRole="button"
+                accessibilityLabel="Estimated calories. Change weight"
+              >
+                <Text style={styles.statLabel} numberOfLines={1}>KCAL</Text>
+                <Text style={[styles.time, isCompact && styles.timeCompact]} numberOfLines={1}>{calories.toLocaleString()}</Text>
+              </Pressable>
             </View>
+
+            <Pressable onPress={openWeightModal} hitSlop={6} style={styles.calorieNote}>
+              <Text style={styles.calorieNoteText}>
+                {usingAverageWeight
+                  ? `Estimates. Calories assume a ${formatWeight(AVERAGE_WEIGHT_KG, profile?.unit ?? 'kg')} average. `
+                  : `Estimates. Calories use your weight (${formatWeight(weightKg, profile?.unit ?? 'kg')}). `}
+                <Text style={styles.calorieNoteLink}>{usingAverageWeight ? 'Add your weight' : 'Change'}</Text>
+              </Text>
+            </Pressable>
 
             {routeError ? <Text style={styles.warning}>{routeError}</Text> : null}
 
@@ -623,22 +720,26 @@ function WalkExplore() {
             </Pressable>
           </View>
 
-          <View style={[styles.summaryRow, styles.contentWidth, isCompact && styles.summaryRowCompact]}>
-            <View style={[styles.summaryCard, isCompact && styles.summaryCardCompact]}>
+          <View style={[styles.summaryRow, styles.contentWidth, summaryWraps && styles.summaryRowCompact]}>
+            <View style={[styles.summaryCard, summaryWraps && styles.summaryCardCompact]}>
               <Text style={styles.summaryValue}>{history.length}</Text>
               <Text style={styles.summaryLabel}>Walks done</Text>
             </View>
-            <View style={[styles.summaryCard, isCompact && styles.summaryCardCompact]}>
+            <View style={[styles.summaryCard, summaryWraps && styles.summaryCardCompact]}>
               <Text style={styles.summaryValue}>{formatDistance(totalWalkedKm)}</Text>
               <Text style={styles.summaryLabel}>Distance</Text>
             </View>
-            <View style={[styles.summaryCard, isCompact && styles.summaryCardCompact]}>
+            <View style={[styles.summaryCard, summaryWraps && styles.summaryCardCompact]}>
               <Text style={styles.summaryValue}>{saved.length}</Text>
               <Text style={styles.summaryLabel}>Saved</Text>
             </View>
-            <View style={[styles.summaryCard, isCompact && styles.summaryCardCompact]}>
+            <View style={[styles.summaryCard, summaryWraps && styles.summaryCardCompact]}>
               <Text style={styles.summaryValue}>{totalSteps.toLocaleString()}</Text>
               <Text style={styles.summaryLabel}>Est. steps</Text>
+            </View>
+            <View style={[styles.summaryCard, summaryWraps && styles.summaryCardCompact]}>
+              <Text style={styles.summaryValue}>{totalCalories.toLocaleString()}</Text>
+              <Text style={styles.summaryLabel}>Est. kcal</Text>
             </View>
           </View>
 
@@ -647,7 +748,7 @@ function WalkExplore() {
               <>
                 <Text style={styles.sectionTitle}>Saved for later</Text>
                 {saved.map((record) => (
-                  <RouteCard key={record.id} record={record} onPress={() => loadRecord(record)} onDelete={() => deleteRecord(record.id)} saved />
+                  <RouteCard key={record.id} record={record} onPress={() => loadRecord(record)} onDelete={() => deleteRecord(record.id)} weightKg={weightKg} saved />
                 ))}
               </>
             )}
@@ -664,7 +765,7 @@ function WalkExplore() {
               </View>
             ) : (
               history.map((record) => (
-                <RouteCard key={record.id} record={record} onPress={() => setSelectedRecord(record)} onDelete={() => deleteRecord(record.id)} />
+                <RouteCard key={record.id} record={record} onPress={() => setSelectedRecord(record)} onDelete={() => deleteRecord(record.id)} weightKg={weightKg} />
               ))
             )}
           </ScrollView>
@@ -708,6 +809,56 @@ function WalkExplore() {
         </KeyboardAvoidingView>
       </Modal>
 
+      <Modal visible={showWeightModal} transparent animationType="fade" onRequestClose={() => setShowWeightModal(false)}>
+        <KeyboardAvoidingView style={[styles.modalBackdrop, isWide && styles.modalBackdropWide]} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Estimate calories</Text>
+            <Text style={styles.modalSubtitle}>
+              Add your weight for a more accurate calorie estimate, or use the {AVERAGE_WEIGHT_KG} kg average. It stays on this device.
+            </Text>
+            <View style={styles.weightRow}>
+              <TextInput
+                value={weightInput}
+                onChangeText={(text) => { setWeightInput(text); setWeightError(''); }}
+                placeholder={weightUnit === 'lb' ? 'e.g. 154' : 'e.g. 70'}
+                placeholderTextColor="#9AA29C"
+                keyboardType="decimal-pad"
+                inputMode="decimal"
+                returnKeyType="done"
+                onSubmitEditing={submitWeight}
+                style={[styles.nameInput, styles.weightInput]}
+                accessibilityLabel={`Weight in ${weightUnit === 'lb' ? 'pounds' : 'kilograms'}`}
+              />
+              <View style={styles.unitToggle}>
+                {(['kg', 'lb'] as const).map((unit) => (
+                  <Pressable
+                    key={unit}
+                    style={[styles.unitOption, weightUnit === unit && styles.unitOptionActive]}
+                    onPress={() => changeWeightUnit(unit)}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: weightUnit === unit }}
+                  >
+                    <Text style={[styles.unitText, weightUnit === unit && styles.unitTextActive]}>{unit}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+            {weightError ? <Text style={styles.weightError}>{weightError}</Text> : null}
+            <View style={styles.weightActions}>
+              <Pressable style={styles.primaryButton} onPress={submitWeight}>
+                <Text style={styles.primaryButtonText}>Save weight</Text>
+              </Pressable>
+              <Pressable
+                style={styles.cancelButton}
+                onPress={() => storeProfile({ weightKg: null, unit: weightUnit })}
+              >
+                <Text style={styles.cancelText}>Use {AVERAGE_WEIGHT_KG} kg average</Text>
+              </Pressable>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
       <Modal visible={!!selectedRecord} transparent animationType="slide" onRequestClose={() => setSelectedRecord(null)}>
         {selectedRecord && (
           <View style={[styles.detailBackdrop, isWide && styles.detailBackdropWide]}>
@@ -726,6 +877,7 @@ function WalkExplore() {
                 <View><Text style={styles.detailValue}>{formatDistance(selectedRecord.distanceKm)}</Text><Text style={styles.detailLabel}>Distance</Text></View>
                 <View><Text style={styles.detailValue}>{formatDuration(selectedRecord.durationMin)}</Text><Text style={styles.detailLabel}>Time</Text></View>
                 <View><Text style={styles.detailValue}>{(selectedRecord.estimatedSteps ?? estimatedStepsForDistance(selectedRecord.distanceKm)).toLocaleString()}</Text><Text style={styles.detailLabel}>Est. steps</Text></View>
+                <View><Text style={styles.detailValue}>{estimatedCalories(selectedRecord.durationMin, weightKg).toLocaleString()}</Text><Text style={styles.detailLabel}>Est. kcal</Text></View>
               </View>
               <Text style={styles.detailDate}>
                 {selectedRecord.completedAt ? `Walked ${formatDateTime(selectedRecord.completedAt)}` : `Saved ${formatDateTime(selectedRecord.createdAt)}`}
@@ -764,11 +916,13 @@ function RouteCard({
   onPress,
   onDelete,
   saved,
+  weightKg,
 }: {
   record: RouteRecord;
   onPress: () => void;
   onDelete: () => void;
   saved?: boolean;
+  weightKg: number;
 }) {
   return (
     <Pressable style={styles.routeCard} onPress={onPress}>
@@ -786,6 +940,8 @@ function RouteCard({
           <Text style={styles.routeMetric}>{formatDuration(record.durationMin)}</Text>
           <Text style={styles.metricDot}>·</Text>
           <Text style={styles.routeMetric}>{(record.estimatedSteps ?? estimatedStepsForDistance(record.distanceKm)).toLocaleString()} steps</Text>
+          <Text style={styles.metricDot}>·</Text>
+          <Text style={styles.routeMetric}>{estimatedCalories(record.durationMin, weightKg).toLocaleString()} kcal</Text>
         </View>
       </View>
       <Pressable onPress={onDelete} hitSlop={10} style={styles.moreButton}>
@@ -850,7 +1006,8 @@ const styles = StyleSheet.create({
   eyebrow: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5, color: COLORS.muted, marginBottom: 4 },
   title: { fontSize: 27, fontWeight: '800', letterSpacing: -0.8, color: COLORS.ink },
   clearText: { color: COLORS.danger, fontWeight: '700' },
-  helper: { color: COLORS.muted, fontSize: 13, marginTop: 5, marginBottom: 10 },
+  helperRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 5, marginBottom: 10 },
+  helper: { flex: 1, color: COLORS.muted, fontSize: 13 },
   pointsRow: { marginBottom: 10 },
   pointChip: {
     flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.card, borderRadius: 18,
@@ -867,14 +1024,29 @@ const styles = StyleSheet.create({
     padding: 13, borderWidth: 1, borderColor: COLORS.line,
   },
   statsCardCompact: { padding: 11 },
-  statDividerCompact: { marginHorizontal: 9 },
-  distanceCompact: { fontSize: 19 },
+  statDividerCompact: { marginHorizontal: 6 },
+  distanceCompact: { fontSize: 17 },
+  timeCompact: { fontSize: 15 },
+  stat: { flexGrow: 1, flexShrink: 1, minWidth: 0 },
+  calorieNote: { marginTop: 7, alignSelf: 'flex-start' },
+  calorieNoteText: { fontSize: 11, color: COLORS.muted },
+  calorieNoteLink: { color: COLORS.accent, fontWeight: '800' },
+  collapsedDetail: { fontSize: 12, fontWeight: '700', color: COLORS.muted, marginTop: 2 },
+  weightRow: { flexDirection: 'row', alignItems: 'center', gap: 9 },
+  weightInput: { flex: 1, minWidth: 0 },
+  unitToggle: { flexDirection: 'row', backgroundColor: COLORS.bg, borderRadius: 14, padding: 3, borderWidth: 1, borderColor: COLORS.line },
+  unitOption: { paddingHorizontal: 14, paddingVertical: 10, borderRadius: 11 },
+  unitOptionActive: { backgroundColor: COLORS.accent },
+  unitText: { fontSize: 14, fontWeight: '800', color: COLORS.muted },
+  unitTextActive: { color: COLORS.white },
+  weightActions: { gap: 8, marginTop: 14 },
+  weightError: { fontSize: 12, color: COLORS.danger, marginTop: 8 },
   statLabel: { fontSize: 8.5, fontWeight: '800', letterSpacing: 1, color: COLORS.muted, marginBottom: 2 },
-  distance: { fontSize: 23, fontWeight: '800', color: COLORS.ink, letterSpacing: -0.5 },
-  time: { fontSize: 18, fontWeight: '800', color: COLORS.ink },
-  statDivider: { width: 1, height: 34, backgroundColor: COLORS.line, marginHorizontal: 16 },
-  routeStatus: { marginLeft: 'auto', alignItems: 'flex-end' },
-  statusDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: COLORS.accent, marginBottom: 4 },
+  distance: { fontSize: 20, fontWeight: '800', color: COLORS.ink, letterSpacing: -0.5 },
+  time: { fontSize: 17, fontWeight: '800', color: COLORS.ink },
+  statDivider: { width: 1, height: 34, backgroundColor: COLORS.line, marginHorizontal: 8 },
+  routeStatus: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  statusDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: COLORS.accent },
   statusDotBusy: { backgroundColor: COLORS.warm },
   statusText: { fontSize: 9, fontWeight: '700', color: COLORS.muted },
   warning: { fontSize: 11, color: '#8C6C31', marginTop: 7 },

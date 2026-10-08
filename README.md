@@ -58,3 +58,10 @@ routes still need a connection. When changing `public/sw.js`, bump its `CACHE` n
 
 ## Estimated steps
 WalkExplore now shows an estimated step count alongside distance and time. The planning estimate uses approximately 1,400 steps per kilometre. Segment chips show estimated steps for each stop-to-stop section, and saved/completed routes retain their estimate. These are planning estimates, not pedometer measurements.
+
+## Estimated calories
+Calories are estimated as 3.5 METs (moderate walking, ~5 km/h) × body weight (kg) × walk duration (hours). The
+first time a route has two or more stops, the app asks for the user's weight in kg or lb, or they can use a 70 kg
+average. Tap the calorie figure or the note under the stats to change it. The weight is stored on the device only
+(SQLite `settings` table natively, localStorage on the web), and calories for saved walks are recalculated with the
+current weight. These are planning estimates, not measurements.

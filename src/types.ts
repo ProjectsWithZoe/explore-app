@@ -30,3 +30,10 @@ export type WalkMapProps = {
   /** Height of UI covering the bottom of the map, so map chrome can sit above it. */
   bottomInset?: number;
 };
+
+export type WeightUnit = 'kg' | 'lb';
+export type Profile = {
+  /** null means the user chose the 70 kg average. */
+  weightKg: number | null;
+  unit: WeightUnit;
+};

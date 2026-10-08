@@ -1,5 +1,5 @@
 import * as SQLite from 'expo-sqlite';
-import type { NewRouteRecord, RouteRecord } from './types';
+import type { NewRouteRecord, Profile, RouteRecord } from './types';
 
 // Native storage backed by Expo SQLite.
 
@@ -22,6 +22,10 @@ function getDb() {
           estimatedSteps INTEGER NOT NULL DEFAULT 0,
           pointsJson TEXT NOT NULL,
           geometryJson TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY NOT NULL,
+          value TEXT NOT NULL
         );
       `);
       try {
@@ -72,4 +76,19 @@ export async function insertRoute(r: NewRouteRecord) {
 export async function deleteRoute(id: number) {
   const db = await getDb();
   await db.runAsync('DELETE FROM routes WHERE id = ?', id);
+}
+
+export async function loadProfile(): Promise<Profile | null> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM settings WHERE key = ?', 'profile');
+  return row ? (JSON.parse(row.value) as Profile) : null;
+}
+
+export async function saveProfile(profile: Profile) {
+  const db = await getDb();
+  await db.runAsync(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    'profile',
+    JSON.stringify(profile),
+  );
 }
