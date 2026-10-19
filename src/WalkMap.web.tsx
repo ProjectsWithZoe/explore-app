@@ -78,6 +78,20 @@ const WalkMap = forwardRef<WalkMapHandle, WalkMapProps>(function WalkMap(
     animateTo(coordinate) {
       mapRef.current?.flyTo({ center: [coordinate.longitude, coordinate.latitude], zoom: 15.5, duration: 600 });
     },
+    fitTo(coordinates, padding) {
+      const map = mapRef.current;
+      if (!map || !coordinates.length) return;
+      const bounds = new maplibregl.LngLatBounds();
+      coordinates.forEach((c) => bounds.extend([c.longitude, c.latitude]));
+      // The panel can cover most of a small screen; never pad more than the map has room for.
+      const { clientWidth: w, clientHeight: h } = map.getContainer();
+      const clamp = (v: number, size: number) => Math.max(0, Math.min(v, size * 0.45));
+      map.fitBounds(bounds, {
+        padding: { top: clamp(padding.top, h), bottom: clamp(padding.bottom, h), left: clamp(padding.left, w), right: clamp(padding.right, w) },
+        maxZoom: 16.5,
+        duration: 700,
+      });
+    },
   }));
 
   // Create the map once.

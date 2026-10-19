@@ -14,6 +14,9 @@ const WalkMap = forwardRef<WalkMapHandle, WalkMapProps>(function WalkMap(
     animateTo(coordinate) {
       mapRef.current?.animateToRegion({ ...coordinate, latitudeDelta: 0.018, longitudeDelta: 0.018 }, 450);
     },
+    fitTo(coordinates, padding) {
+      if (coordinates.length) mapRef.current?.fitToCoordinates(coordinates, { edgePadding: padding, animated: true });
+    },
   }));
 
   return (

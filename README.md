@@ -51,6 +51,7 @@ routes still need a connection. When changing `public/sw.js`, bump its `CACHE` n
 - Tap the map to add Start / Stop points
 - Walking route geometry and distance via Valhalla/OpenStreetMap
 - Route estimate fallback when the routing service is unavailable
+- Circular walks: pick a start and a distance (0–50 km) and get a loop back to the start, with Shuffle for another
 - Save routes for later
 - Log completed walks with date/time
 - Local route history using Expo SQLite
@@ -78,3 +79,16 @@ walks saved on the device move into the account.
   the account (15 min, doubling up to 24 h), and an IP is limited to 20 failed sign-ins per 15 minutes and 10 sign-ups
   per hour. There is no PIN reset.
 - Native builds call the deployed API at `EXPO_PUBLIC_API_URL` (defaults to https://explore-app-three.vercel.app).
+
+## Circular walks (Loop mode)
+Switch the planner to **Loop**, tap the map (or **Start here**) to set the start, choose a distance on the slider
+(0–50 km, in 0.5 km steps) and tap **Generate**. The code is in `src/routing.ts` (`findLoops`) and the slider is
+`src/DistanceSlider.tsx`.
+
+Valhalla has no round-trip mode, so each loop is a triangle or square of waypoints that passes through the start,
+routed start → corners → start with "through" waypoints (no U-turns at the corners). The first try measures how
+winding the local streets are, then three more directions are routed at the corrected size. Loops within 12% of the
+chosen distance are ranked by turns (left, right, sharp and U-turns), with a penalty for walking back over the same
+streets, and the simplest is shown. **Shuffle** goes through the other loops from that search first, then searches
+directions not tried yet. One search makes about 4–6 requests to the public Valhalla server. Saved loops store the
+start, corners and finish, so they reopen with the same line.

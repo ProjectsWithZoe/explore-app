@@ -18,6 +18,8 @@ import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-cont
 import WalkMap from './src/WalkMap';
 import { clearRoutes, deleteRoute, insertRoute, listRoutes, loadProfile, loadSession, saveProfile, saveSession } from './src/storage';
 import { ApiError, api, pinProblem, randomUsername } from './src/api';
+import { LOOP_TOLERANCE, ROUTER_URL, decodePolyline6, findLoops, haversineKm, type LoopRoute } from './src/routing';
+import DistanceSlider from './src/DistanceSlider';
 import type { Coordinate, NewRouteRecord, Profile, Region, RoutePoint, RouteRecord, Session, WalkMapHandle, WeightUnit } from './src/types';
 
 const COLORS = {
@@ -34,26 +36,20 @@ const COLORS = {
 };
 
 const DEFAULT_CENTER = { latitude: 51.5074, longitude: -0.1278 };
-const ROUTER_URL = 'https://valhalla1.openstreetmap.de/route';
 const WIDE_BREAKPOINT = 768;
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
-function haversineKm(a: Coordinate, b: Coordinate) {
-  const R = 6371;
-  const dLat = ((b.latitude - a.latitude) * Math.PI) / 180;
-  const dLon = ((b.longitude - a.longitude) * Math.PI) / 180;
-  const la1 = (a.latitude * Math.PI) / 180;
-  const la2 = (b.latitude * Math.PI) / 180;
-  const x = Math.sin(dLat / 2) ** 2 + Math.sin(dLon / 2) ** 2 * Math.cos(la1) * Math.cos(la2);
-  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
-}
-
 function formatDistance(km: number) {
   if (!Number.isFinite(km)) return '—';
   return km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(km >= 10 ? 1 : 2)} km`;
+}
+
+// Slider values are whole or half kilometres.
+function formatKm(km: number) {
+  return `${Number.isInteger(km) ? km : km.toFixed(1)} km`;
 }
 
 function estimatedStepsForDistance(km: number) {
@@ -63,6 +59,11 @@ function estimatedStepsForDistance(km: number) {
 }
 
 type Tab = 'plan' | 'routes' | 'profile';
+// 'stops': tap to add stops in order. 'loop': pick a start and a distance and get a circular walk.
+type PlanMode = 'stops' | 'loop';
+const LOOP_MAX_KM = 50;
+const LOOP_STEP_KM = 0.5;
+const DEFAULT_ROUTE_NAME = 'My walking route';
 
 const AVERAGE_WEIGHT_KG = 70;
 const KG_PER_LB = 0.45359237;
@@ -100,39 +101,6 @@ function formatDateTime(iso?: string | null) {
     hour: 'numeric',
     minute: '2-digit',
   }).format(new Date(iso));
-}
-
-// Valhalla's default encoded shape is polyline6. Decode without an extra package.
-function decodePolyline6(encoded: string): Coordinate[] {
-  let index = 0;
-  let lat = 0;
-  let lon = 0;
-  const coordinates: Coordinate[] = [];
-  const factor = 1e6;
-
-  while (index < encoded.length) {
-    let result = 0;
-    let shift = 0;
-    let byte = 0;
-    do {
-      byte = encoded.charCodeAt(index++) - 63;
-      result |= (byte & 0x1f) << shift;
-      shift += 5;
-    } while (byte >= 0x20);
-    lat += result & 1 ? ~(result >> 1) : result >> 1;
-
-    result = 0;
-    shift = 0;
-    do {
-      byte = encoded.charCodeAt(index++) - 63;
-      result |= (byte & 0x1f) << shift;
-      shift += 5;
-    } while (byte >= 0x20);
-    lon += result & 1 ? ~(result >> 1) : result >> 1;
-
-    coordinates.push({ latitude: lat / factor, longitude: lon / factor });
-  }
-  return coordinates;
 }
 
 async function routeWithValhalla(points: RoutePoint[]) {
@@ -213,9 +181,23 @@ function WalkExplore() {
   const [durationMin, setDurationMin] = useState(0);
   const [estimatedSteps, setEstimatedSteps] = useState(0);
   const [segmentSteps, setSegmentSteps] = useState<number[]>([]);
+  // Loading a saved walk restores its stored line; don't re-route it.
+  const skipNextRoute = useRef(false);
+  const [planMode, setPlanMode] = useState<PlanMode>('stops');
+  const [loopStart, setLoopStart] = useState<RoutePoint | null>(null);
+  const [loopKm, setLoopKm] = useState(5);
+  const [loopRoute, setLoopRoute] = useState<LoopRoute | null>(null);
+  const [loopBusy, setLoopBusy] = useState(false);
+  const [loopError, setLoopError] = useState('');
+  // Spare loops from the last search (best first) for instant Shuffle, and every direction tried so far.
+  const loopQueue = useRef<LoopRoute[]>([]);
+  // Which of the last search's loops is showing (0 = fewest turns) and how many it found.
+  const [loopPick, setLoopPick] = useState({ index: 0, of: 0 });
+  const loopBearings = useRef<number[]>([]);
+  const loopRun = useRef(0);
   const [routing, setRouting] = useState(false);
   const [routeError, setRouteError] = useState('');
-  const [routeName, setRouteName] = useState('My walking route');
+  const [routeName, setRouteName] = useState(DEFAULT_ROUTE_NAME);
   const [showNameModal, setShowNameModal] = useState(false);
   const [pendingAction, setPendingAction] = useState<'save' | 'complete' | null>(null);
   const [records, setRecords] = useState<RouteRecord[]>([]);
@@ -228,7 +210,14 @@ function WalkExplore() {
   const [weightError, setWeightError] = useState('');
   const weightKg = profile?.weightKg ?? AVERAGE_WEIGHT_KG;
   const usingAverageWeight = !profile?.weightKg;
-  const calories = estimatedCalories(durationMin, weightKg);
+  const loopMode = planMode === 'loop';
+  const shownPoints = loopMode ? (loopStart ? [loopStart] : []) : points;
+  const shownGeometry = loopMode ? loopRoute?.geometry ?? [] : routeGeometry;
+  const shownDistanceKm = loopMode ? loopRoute?.distanceKm ?? 0 : distanceKm;
+  const shownDurationMin = loopMode ? loopRoute?.durationMin ?? 0 : durationMin;
+  const shownSteps = loopMode ? estimatedStepsForDistance(shownDistanceKm) : estimatedSteps;
+  const hasRoute = loopMode ? !!loopRoute : points.length > 1;
+  const calories = estimatedCalories(shownDurationMin, weightKg);
 
   const userCoordinate: Coordinate | null = location
     ? { latitude: location.coords.latitude, longitude: location.coords.longitude }
@@ -271,8 +260,8 @@ function WalkExplore() {
 
   // Ask for a weight once, the first time a route has a calorie estimate to show.
   useEffect(() => {
-    if (profile === null && points.length > 1 && !showNameModal) openWeightModal();
-  }, [profile, points.length]);
+    if (profile === null && hasRoute && !showNameModal) openWeightModal();
+  }, [profile, hasRoute]);
 
   // The map mounts before the location fix arrives, so jump to the user once it does.
   useEffect(() => {
@@ -289,6 +278,11 @@ function WalkExplore() {
       setEstimatedSteps(0);
       setSegmentSteps([]);
       setRouteError('');
+      return;
+    }
+
+    if (skipNextRoute.current) {
+      skipNextRoute.current = false;
       return;
     }
 
@@ -532,6 +526,10 @@ function WalkExplore() {
 
   function addCurrentLocation() {
     if (!location) return;
+    if (loopMode) {
+      setLoopStartAt({ latitude: location.coords.latitude, longitude: location.coords.longitude });
+      return;
+    }
     if (points.some((p) => haversineKm(p, location.coords) < 0.01)) return;
     setPoints((prev) => [
       ...prev,
@@ -545,6 +543,10 @@ function WalkExplore() {
   }
 
   function addMapPoint(coordinate: Coordinate) {
+    if (loopMode) {
+      setLoopStartAt(coordinate);
+      return;
+    }
     setPoints((prev) => [
       ...prev,
       {
@@ -562,7 +564,80 @@ function WalkExplore() {
     })));
   }
 
+  function resetLoop() {
+    loopRun.current++; // abandon any search in flight
+    setLoopBusy(false);
+    setLoopRoute(null);
+    setLoopError('');
+    loopQueue.current = [];
+    loopBearings.current = [];
+  }
+
+  function setLoopStartAt(coordinate: Coordinate) {
+    resetLoop();
+    setLoopStart({ ...coordinate, id: uid(), label: 'Start' });
+  }
+
+  function changeLoopKm(km: number) {
+    setLoopKm(km);
+    // Spare loops were sized for the old distance.
+    loopQueue.current = [];
+    loopBearings.current = [];
+    setLoopError('');
+  }
+
+  function showLoop(route: LoopRoute) {
+    setLoopRoute(route);
+    setRouteName(DEFAULT_ROUTE_NAME);
+    const padding = isWide
+      ? { top: 40, right: 40, bottom: 40, left: 440 }
+      : { top: topInset + 60, right: 30, bottom: panelHeight + 20, left: 30 };
+    mapRef.current?.fitTo(route.geometry, padding);
+  }
+
+  // Generate a loop, or on later presses show a different one: from the spares first, otherwise a fresh search
+  // in directions not tried yet.
+  async function generateLoop() {
+    if (!loopStart || loopKm <= 0 || loopBusy) return;
+    const spare = loopQueue.current.shift();
+    if (spare) {
+      showLoop(spare);
+      setLoopPick((p) => ({ ...p, index: p.index + 1 }));
+      return;
+    }
+    const run = ++loopRun.current;
+    setLoopBusy(true);
+    setLoopError('');
+    try {
+      const found = await findLoops(loopStart, loopKm, loopBearings.current);
+      if (run !== loopRun.current) return;
+      if (!found.length) {
+        setLoopError('Couldn’t find a walkable loop from here. Try moving the start onto a street or path, or pick another distance.');
+        return;
+      }
+      showLoop(found[0]);
+      setLoopPick({ index: 0, of: found.length });
+      loopQueue.current = found.slice(1);
+    } catch (e) {
+      console.warn(e);
+      if (run === loopRun.current) setLoopError('The walking route service didn’t respond. Check your connection and try again.');
+    } finally {
+      if (run === loopRun.current) setLoopBusy(false);
+    }
+  }
+
+  function changePlanMode(mode: PlanMode) {
+    setPlanMode(mode);
+    // Moving to loops with stops already placed: start the loop where the walk started.
+    if (mode === 'loop' && !loopStart && points.length) setLoopStartAt(points[0]);
+  }
+
   function clearPlan() {
+    if (loopMode) {
+      resetLoop();
+      setLoopStart(null);
+      return;
+    }
     setPoints([]);
     setRouteGeometry([]);
     setDistanceKm(0);
@@ -571,26 +646,37 @@ function WalkExplore() {
   }
 
   function requestSave(action: 'save' | 'complete') {
-    if (points.length < 2) {
-      notify('Add another stop', 'Tap the map to add at least two points to your route.');
+    if (!hasRoute) {
+      if (loopMode) notify('No loop yet', loopStart ? 'Tap Generate loop first.' : 'Tap the map to choose a start, then generate a loop.');
+      else notify('Add another stop', 'Tap the map to add at least two points to your route.');
       return;
     }
+    if (loopMode && routeName === DEFAULT_ROUTE_NAME) setRouteName(`${formatDistance(shownDistanceKm)} loop`);
     setPendingAction(action);
     setShowNameModal(true);
   }
 
   async function persistRoute(action: 'save' | 'complete') {
     const now = new Date().toISOString();
+    // A loop is stored as its start, the corners it was routed through, and the start again as the finish,
+    // so reopening and editing it in stop mode keeps the same shape.
+    const loopPoints: RoutePoint[] = loopRoute && loopStart
+      ? [
+          loopStart,
+          ...loopRoute.waypoints.map((w, i) => ({ ...w, id: uid(), label: `Via ${i + 1}` })),
+          { ...loopStart, id: uid(), label: 'Finish' },
+        ]
+      : [];
     const walk: NewRouteRecord = {
       name: routeName.trim() || 'Walking route',
       createdAt: now,
       completedAt: action === 'complete' ? now : null,
       saved: action === 'save' ? 1 : 0,
-      distanceKm,
-      durationMin,
-      estimatedSteps,
-      points,
-      geometry: routeGeometry,
+      distanceKm: shownDistanceKm,
+      durationMin: shownDurationMin,
+      estimatedSteps: shownSteps,
+      points: loopMode ? loopPoints : points,
+      geometry: shownGeometry,
     };
     try {
       const s = sessionRef.current;
@@ -625,6 +711,8 @@ function WalkExplore() {
   }
 
   function loadRecord(record: RouteRecord) {
+    skipNextRoute.current = record.geometry.length > 1 && record.points !== points;
+    setPlanMode('stops');
     setPoints(record.points);
     setRouteGeometry(record.geometry);
     setDistanceKm(record.distanceKm);
@@ -654,8 +742,8 @@ function WalkExplore() {
           <WalkMap
             ref={mapRef}
             initialRegion={currentRegion}
-            points={points}
-            geometry={routeGeometry}
+            points={shownPoints}
+            geometry={shownGeometry}
             userLocation={userCoordinate}
             onPress={addMapPoint}
             accentColor={COLORS.accent}
@@ -704,20 +792,23 @@ function WalkExplore() {
                 {collapsed && (
                   <Pressable style={styles.collapsedRow} onPress={() => setPanelCollapsed(false)}>
                     <View style={{ flex: 1, minWidth: 0 }}>
-                      {points.length > 1 ? (
+                      {hasRoute ? (
                         <>
                           <Text style={styles.collapsedSummary} numberOfLines={1}>
-                            {formatDistance(distanceKm)} · {formatDuration(durationMin)}
+                            {loopMode ? '⟳ ' : ''}{formatDistance(shownDistanceKm)} · {formatDuration(shownDurationMin)}
                           </Text>
                           <Text style={styles.collapsedDetail} numberOfLines={1}>
-                            {estimatedSteps.toLocaleString()} steps · {calories.toLocaleString()} kcal
+                            {shownSteps.toLocaleString()} steps · {calories.toLocaleString()} kcal
+                            {loopMode && loopRoute ? ` · ${loopRoute.turns} turns` : ''}
                           </Text>
                         </>
                       ) : (
                         <>
-                          <Text style={styles.eyebrow}>ROUTE PLANNER</Text>
+                          <Text style={styles.eyebrow}>{loopMode ? 'LOOP' : 'ROUTE PLANNER'}</Text>
                           <Text style={styles.collapsedSummary} numberOfLines={1}>
-                            {points.length === 1 ? 'Start set. Tap the map to add a stop' : 'Tap the map to start a walk'}
+                            {loopMode
+                              ? loopStart ? 'Start set. Open to generate a loop' : 'Tap the map to set the start'
+                              : points.length === 1 ? 'Start set. Tap the map to add a stop' : 'Tap the map to start a walk'}
                           </Text>
                         </>
                       )}
@@ -735,10 +826,10 @@ function WalkExplore() {
             <View style={styles.panelHeader}>
               <View>
                 <Text style={styles.eyebrow}>ROUTE PLANNER</Text>
-                <Text style={styles.title}>Build your walk</Text>
+                <Text style={styles.title}>{loopMode ? 'Make a loop' : 'Build your walk'}</Text>
               </View>
               <View style={styles.panelHeaderActions}>
-                {points.length > 0 && (
+                {(loopMode ? !!loopStart : points.length > 0) && (
                   <Pressable onPress={clearPlan} hitSlop={8}>
                     <Text style={styles.clearText}>Clear</Text>
                   </Pressable>
@@ -757,15 +848,97 @@ function WalkExplore() {
               </View>
             </View>
 
+            <View style={styles.modeToggle} accessibilityRole="tablist">
+              {([['stops', 'Stops'], ['loop', '⟳  Loop']] as const).map(([mode, label]) => (
+                <Pressable
+                  key={mode}
+                  style={[styles.modeOption, planMode === mode && styles.modeOptionActive]}
+                  onPress={() => changePlanMode(mode)}
+                  accessibilityRole="tab"
+                  accessibilityState={{ selected: planMode === mode }}
+                >
+                  <Text style={[styles.modeText, planMode === mode && styles.modeTextActive]}>{label}</Text>
+                </Pressable>
+              ))}
+            </View>
+
             <View style={styles.helperRow}>
-              <Text style={styles.helper}>Tap anywhere on the map to add your next stop.</Text>
+              <Text style={styles.helper}>
+                {loopMode
+                  ? loopStart ? 'Tap the map to move the start. The loop ends where it starts.' : 'Tap the map to choose where your loop starts and ends.'
+                  : 'Tap anywhere on the map to add your next stop.'}
+              </Text>
               <View style={styles.routeStatus}>
-                <View style={[styles.statusDot, routing && styles.statusDotBusy]} />
-                <Text style={styles.statusText}>{routing ? 'Routing…' : points.length > 1 ? 'Walkable' : 'Ready'}</Text>
+                <View style={[styles.statusDot, (loopMode ? loopBusy : routing) && styles.statusDotBusy]} />
+                <Text style={styles.statusText}>
+                  {loopMode
+                    ? loopBusy ? 'Searching…' : loopRoute ? 'Loop ready' : 'Ready'
+                    : routing ? 'Routing…' : points.length > 1 ? 'Walkable' : 'Ready'}
+                </Text>
               </View>
             </View>
 
-            {points.length > 0 && (
+            {loopMode && (
+              <View style={styles.loopCard}>
+                <View style={styles.loopHeader}>
+                  <Text style={styles.statLabel}>LOOP DISTANCE</Text>
+                  <Text style={styles.loopKm}>{formatKm(loopKm)}</Text>
+                </View>
+                <DistanceSlider
+                  value={loopKm}
+                  min={0}
+                  max={LOOP_MAX_KM}
+                  step={LOOP_STEP_KM}
+                  onChange={changeLoopKm}
+                  color={COLORS.accent}
+                  trackColor={COLORS.line}
+                  accessibilityLabel="Loop distance"
+                  formatValue={(km) => `${km} kilometres`}
+                />
+                <View style={styles.loopScale}>
+                  <Text style={styles.loopScaleText}>0 km</Text>
+                  <Text style={styles.loopScaleText}>{LOOP_MAX_KM} km</Text>
+                </View>
+                <View style={styles.loopActions}>
+                  {!loopStart && userCoordinate && (
+                    <Pressable style={styles.secondaryButton} onPress={addCurrentLocation}>
+                      <Text style={styles.secondaryButtonText}>⌾  Start here</Text>
+                    </Pressable>
+                  )}
+                  <Pressable
+                    style={[styles.primaryButton, (!loopStart || loopKm <= 0 || loopBusy) && styles.buttonDisabled]}
+                    onPress={generateLoop}
+                    disabled={!loopStart || loopKm <= 0 || loopBusy}
+                    accessibilityRole="button"
+                  >
+                    <Text style={styles.primaryButtonText}>
+                      {loopBusy
+                        ? 'Finding a loop…'
+                        : loopRoute && loopRoute.targetKm === loopKm
+                          ? '↻  Shuffle route'
+                          : loopKm > 0 ? `Generate ${formatKm(loopKm)} loop` : 'Generate loop'}
+                    </Text>
+                  </Pressable>
+                </View>
+                {!loopStart ? (
+                  <Text style={styles.loopNote}>Pick a start point on the map first.</Text>
+                ) : loopKm <= 0 ? (
+                  <Text style={styles.loopNote}>Slide to choose how far you want to walk.</Text>
+                ) : loopRoute ? (
+                  <Text style={styles.loopNote}>
+                    {loopRoute.turns} {loopRoute.turns === 1 ? 'turn' : 'turns'}
+                    {Math.abs(loopRoute.distanceKm - loopRoute.targetKm) / loopRoute.targetKm > LOOP_TOLERANCE
+                      ? ` · the closest loop we found to ${formatKm(loopRoute.targetKm)}`
+                      : loopPick.of > 1
+                        ? loopPick.index === 0 ? ` · simplest of ${loopPick.of} loops found` : ` · option ${loopPick.index + 1} of ${loopPick.of}`
+                        : ''}
+                    {loopRoute.targetKm === loopKm ? '. Not keen? Shuffle for another.' : ''}
+                  </Text>
+                ) : null}
+              </View>
+            )}
+
+            {!loopMode && points.length > 0 && (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.pointsRow}>
                 {points.map((point, index) => (
                   <View key={point.id} style={styles.pointChip}>
@@ -784,17 +957,17 @@ function WalkExplore() {
             <View style={[styles.statsCard, isCompact && styles.statsCardCompact]}>
               <View style={styles.stat}>
                 <Text style={styles.statLabel} numberOfLines={1}>DISTANCE</Text>
-                <Text style={[styles.distance, isCompact && styles.distanceCompact]} numberOfLines={1}>{formatDistance(distanceKm)}</Text>
+                <Text style={[styles.distance, isCompact && styles.distanceCompact]} numberOfLines={1}>{formatDistance(shownDistanceKm)}</Text>
               </View>
               <View style={[styles.statDivider, isCompact && styles.statDividerCompact]} />
               <View style={styles.stat}>
                 <Text style={styles.statLabel} numberOfLines={1}>TIME</Text>
-                <Text style={[styles.time, isCompact && styles.timeCompact]} numberOfLines={1}>{formatDuration(durationMin)}</Text>
+                <Text style={[styles.time, isCompact && styles.timeCompact]} numberOfLines={1}>{formatDuration(shownDurationMin)}</Text>
               </View>
               <View style={[styles.statDivider, isCompact && styles.statDividerCompact]} />
               <View style={styles.stat}>
                 <Text style={styles.statLabel} numberOfLines={1}>STEPS</Text>
-                <Text style={[styles.time, isCompact && styles.timeCompact]} numberOfLines={1}>{estimatedSteps.toLocaleString()}</Text>
+                <Text style={[styles.time, isCompact && styles.timeCompact]} numberOfLines={1}>{shownSteps.toLocaleString()}</Text>
               </View>
               <View style={[styles.statDivider, isCompact && styles.statDividerCompact]} />
               <Pressable
@@ -817,9 +990,10 @@ function WalkExplore() {
               </Text>
             </Pressable>
 
-            {routeError ? <Text style={styles.warning}>{routeError}</Text> : null}
+            {!loopMode && routeError ? <Text style={styles.warning}>{routeError}</Text> : null}
+            {loopMode && loopError ? <Text style={styles.warning}>{loopError}</Text> : null}
 
-            {points.length > 1 && (
+            {!loopMode && points.length > 1 && (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.segmentRow}>
                 {points.slice(1).map((point, index) => (
                   <View key={point.id} style={styles.segmentChip}>
@@ -1496,6 +1670,19 @@ const styles = StyleSheet.create({
   eyebrow: { fontSize: 10, fontWeight: '800', letterSpacing: 1.5, color: COLORS.muted, marginBottom: 4 },
   title: { fontSize: 27, fontWeight: '800', letterSpacing: -0.8, color: COLORS.ink },
   clearText: { color: COLORS.danger, fontWeight: '700' },
+  modeToggle: { flexDirection: 'row', backgroundColor: '#EEF1ED', borderRadius: 14, padding: 3, marginTop: 10 },
+  modeOption: { flex: 1, alignItems: 'center', paddingVertical: 8, borderRadius: 11 },
+  modeOptionActive: { backgroundColor: COLORS.card, boxShadow: '0 1px 3px rgba(0,0,0,0.12)' } as any,
+  modeText: { fontSize: 13, fontWeight: '800', color: COLORS.muted },
+  modeTextActive: { color: COLORS.ink },
+  loopCard: { backgroundColor: COLORS.bg, borderRadius: 18, padding: 13, marginBottom: 10, borderWidth: 1, borderColor: COLORS.line },
+  loopHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
+  loopKm: { fontSize: 22, fontWeight: '800', color: COLORS.ink, letterSpacing: -0.5 },
+  loopScale: { flexDirection: 'row', justifyContent: 'space-between', marginTop: -4 },
+  loopScaleText: { fontSize: 10, fontWeight: '700', color: COLORS.muted },
+  loopActions: { flexDirection: 'row', gap: 9, marginTop: 10 },
+  loopNote: { fontSize: 11, color: COLORS.muted, marginTop: 8, lineHeight: 15 },
+  buttonDisabled: { opacity: 0.45 },
   helperRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 5, marginBottom: 10 },
   helper: { flex: 1, color: COLORS.muted, fontSize: 13 },
   pointsRow: { marginBottom: 10 },

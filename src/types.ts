@@ -15,8 +15,12 @@ export type RouteRecord = {
 };
 export type NewRouteRecord = Omit<RouteRecord, 'id'>;
 
+export type EdgePadding = { top: number; right: number; bottom: number; left: number };
+
 export type WalkMapHandle = {
   animateTo: (coordinate: Coordinate) => void;
+  /** Zoom so every coordinate is visible, keeping clear of UI covering the edges. */
+  fitTo: (coordinates: Coordinate[], padding: EdgePadding) => void;
 };
 
 export type WalkMapProps = {
